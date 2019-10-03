@@ -1,3 +1,9 @@
+#title           :megaRaidStatus.sh
+#description     :This script checks for kernel versions available on CL/RHEL servers.
+#author		 :prasul
+#date            :20191003
+#version         :0.4    
+#usage		 :bash  megaRaidStatus.sh
 
 #!/bin/bash
 STATUS=$(/usr/bin/MegaCli64 -CfgDsply -aALL -nolog |grep '^State' |awk '{print $3}')
