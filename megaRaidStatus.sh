@@ -9,7 +9,8 @@
 STATUS=$(/usr/bin/MegaCli64 -CfgDsply -aALL -nolog |grep '^State' |awk '{print $3}')
 #STATUS=degraded
 RAIDSTATUS=$(/usr/bin/MegaCli64 -LDInfo -Lall -aALL |grep -C6 Degraded)
-HOSTNAME=$(echo "`hostname` : `ifconfig | sed -En 's/127.0.0.1//;s/.*inet (addr:)?(([0-9]*\.){3}[0-9]*).*/\2/p'`")
+#HOSTNAME=$(echo "`hostname` : `ifconfig | sed -En 's/127.0.0.1//;s/.*inet (addr:)?(([0-9]*\.){3}[0-9]*).*/\2/p'`")
+HOSTNAME=$(echo "`hostname` : `ifconfig | sed -En 's/127.0.0.1//;s/.*inet (addr:)?(([0-9]*\.){3}[0-9]*).*/\2/p'|head -1`")
 #RAIDSTATUS=/usr/bin/MegaCli64 -LDRecon ShowProg L0 -a0
 echo $HOSTNAME $STATUS : $RAIDSTATUS
 if [ "$STATUS" != "Optimal" ]; then
