@@ -24,7 +24,7 @@ do
   	mv "$file" $filename.png;
 	tput setaf 2;
   	echo "\nUploading screenshot:";tput setaf 3; 
-	curl --speed-time --progress-bar -T $filename.png ftp://$ftpservip --user $ftpun:$ftppw; 
+	curl --progress-bar -T $filename.png ftp://$ftpservip --user $ftpun:$ftppw; 
 	newshareurl="$shareurl/$filename.png"; 
 	echo $newshareurl >> urls;
 	tput setaf 4; echo "removing screenshot from local...";
