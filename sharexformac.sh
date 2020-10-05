@@ -18,14 +18,15 @@ scrnshotprfx=
 for f in *\ *; do mv 2>/dev/null "$f" "${f// /_}"; done
 
 #filename change and upload
-for file in `find . -name $scrnshotprfx*.png`;
+for file in `find . -name "$scrnshotprfx*.png"`;
 do 
 	filename=`/usr/bin/openssl rand -hex 24`;
   mv "$file" $filename.png;
 	tput setaf 2;
   echo "\nUploading screenshot:";tput setaf 3; 
-	curl --progress-bar -T $filename.png ftp://$ftpservip --user $ftpun:$ftppw; shareurl="$shareurl/$filename.png"; 
-	echo $shareurl >> urls;
+	curl --speed-time --progress-bar -T $filename.png ftp://$ftpservip --user $ftpun:$ftppw; 
+	newshareurl="$shareurl/$filename.png"; 
+	echo $newshareurl >> urls;
 	tput setaf 4; echo "removing screenshot from local...";
 	rm -v $filename*
 done
