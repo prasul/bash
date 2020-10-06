@@ -20,12 +20,13 @@ for f in *\ *; do mv 2>/dev/null "$f" "${f// /_}"; done
 #filename change and upload
 for file in `find . -name "$scrnshotprfx*.png"`;
 do 
+	ext=${file: -4};
 	filename=`/usr/bin/openssl rand -hex 24`;
-  	mv "$file" $filename.png;
+  	mv "$file" $filename$ext;
 	tput setaf 2;
   	echo "\nUploading screenshot:";tput setaf 3; 
-	curl --progress-bar -T $filename.png ftp://$ftpservip --user $ftpun:$ftppw; 
-	newshareurl="$shareurl/$filename.png"; 
+	curl --progress-bar -T $filename$ext ftp://$ftpservip --user $ftpun:$ftppw; 
+	newshareurl="$shareurl/$filename$ext"; 
 	echo $newshareurl >> urls;
 	tput setaf 4; echo "removing screenshot from local...";
 	rm -v $filename*
