@@ -38,7 +38,7 @@ do
 	filename=`/usr/bin/openssl rand -hex 24`;
 	mv "$file" $filename$ext;
 	tput setaf 2;echo "\nUploading screenshot:";tput setaf 3; 
-	curl --progress-bar -T $filename$ext ftp://$ftpservip --user $ftpun:$ftppw || { echo 'uploading failed - try again manually' ; exit 1; }
+	lftp -c "set ftp:ssl-protect-data true; set ftp:ssl-force true; set ftp:ssl-auth TLS; set ssl:verify-certificate no; open -u $ftpun,$ftppw $ftppw; put -O / $filename$ext"|| { echo 'uploading failed - try again manually' ; exit 1; }
 	newshareurl="$shareurl/$filename$ext"; 
 	echo $newshareurl >> urls;
 	newshareurl="";
