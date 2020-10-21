@@ -3,6 +3,10 @@
 #Prasuls bash script to create a random name for screenshot name in MAC and upload it to FTP server. 
 #Upload the script on to the folder where the screenshots are getting created.
 #Warning: Script doesn't take screenshots yet - it just renames and uploads the file to FTP
+#
+#REQUIREMENTS 
+#imagemagick
+#lftp
 
 #Get username and password
 
