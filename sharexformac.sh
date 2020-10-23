@@ -35,6 +35,8 @@ do
 		echo "compressing the file.."
 		magick $file -strip -interlace Plane -resize 80% -quality 80 newfile.png || { echo 'convert command failed, check if imagemagick is installed' ; exit 1; }
 		rm -fv $file;
+		convert -colors 254 newfile.png out.png;
+		mv out.png newfile.png;
 		file=newfile.png;
 	else
 		echo "no optimizations done!"
