@@ -272,14 +272,14 @@ while true; do
     #} > "$C2"
 
 
-    # RIGHT — MySQL
+# RIGHT — MySQL
     {
-        printf "${MAGENTA}${BOLD}  ▶  MYSQL PROCESSES (ACTIVE)${R}\n"
-        printf "  ${DGRAY}%-6s %-12s %-5s %-15s %s${R}\n" "ID" "DB" "TIME" "STATE" "QUERY"
-        printf "  ${DGRAY}%-6s %-12s %-5s %-15s %s${R}\n" "────" "────────────" "────" "───────────────" "──────────────────────"
+        printf "${MAGENTA}${BOLD}  ▶  MYSQL ACTIVE PROCESSES${R}\n"
+        printf "  ${DGRAY}%-6s %-10s %-4s %-12s %s${R}\n" "ID" "DB" "TIME" "STATE" "QUERY"
+        printf "  ${DGRAY}%-6s %-10s %-4s %-12s %s${R}\n" "────" "──────────" "────" "────────────" "──────────────────────"
         
-        # Querying information_schema for deep details
-        # We filter for non-Sleep commands to keep the list relevant
+        # We fetch ID, DB, TIME, STATE, and the FULL query (INFO)
+        # We filter out Sleep to only show active threats/tasks
         mysql_out=$(mysql -e "SELECT ID, DB, TIME, STATE, INFO 
             FROM information_schema.PROCESSLIST 
             WHERE COMMAND != 'Sleep' AND INFO IS NOT NULL 
@@ -288,24 +288,24 @@ while true; do
         if [ -z "$mysql_out" ] || [ $(echo "$mysql_out" | wc -l) -le 1 ]; then
             printf "  ${GRAY}${DIM}(no active queries)${R}\n"
         else
+            # Logic: We use \t as a delimiter to handle spaces within the Query text
             echo "$mysql_out" | awk 'NR>1 {
-                id=$1; db=$2; t=$3;
-                # Combine State columns (State can be multiple words)
-                # This logic handles variable column positions for the State and Info
-                state=$4;
+                id=$1; db=$2; time=$3; 
                 
-                # Capture the Query (INFO column) - usually the last part
+                # Handle Database NULLs
+                if (db == "NULL") db = "system";
+                
+                # Color time: Red if query > 5s
+                tc = (time > 5) ? "\033[38;5;196m" : "\033[38;5;214m";
+
+                # The Query content starts at column 5 and goes to the end
                 query=""; for(i=5;i<=NF;i++) query=query $i " ";
                 
-                # Cleanup: If DB is NULL, show "---"
-                if (db == "NULL") db = "---";
-                
-                # Color code time: Red if > 10s
-                tc = "\033[38;5;255m";
-                if (t > 10) tc = "\033[38;5;196m";
-                
-                printf "  \033[38;5;244m%-6s\033[0m \033[38;5;82m%-12.12s\033[0m %s%-5s\033[0m \033[38;5;45m%-15.15s\033[0m \033[38;5;255m%.40s\033[0m\n",
-                    id, db, tc, t"s", state, query
+                # State: we take the 4th column but truncate it to keep the table clean
+                state=$4;
+
+                printf "  \033[38;5;244m%-6s\033[0m \033[38;5;82m%-10.10s\033[0m %s%-4s\033[0m \033[38;5;45m%-12.12s\033[0m \033[38;5;255m%.45s\033[0m\n",
+                    id, db, tc, time"s", state, query
             }'
         fi
     } > "$C2"
