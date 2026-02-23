@@ -184,9 +184,17 @@ while true; do
             esac
             printf "  ${sc}%-24s${R}  ${WHITE}%s${R}\n" "$state" "$cnt"
         done
-        syn_count=$(netstat -ant 2>/dev/null | grep -c "SYN_RECV" || echo 0)
-        if [ "${syn_count:-0}" -gt 20 ]; then
-            printf "\n  ${RED}${BOLD}${BLINK}⚠ SYN FLOOD: %s conns!${R}\n" "$syn_count"
+        
+        #syn_count=$(netstat -ant 2>/dev/null | grep -c "SYN_RECV" || echo 0)
+        #if [ "${syn_count:-0}" -gt 20 ]; then
+        #    printf "\n  ${RED}${BOLD}${BLINK}⚠ SYN FLOOD: %s conns!${R}\n" "$syn_count"
+        #fi
+        
+        # We use head -n1 to ensure we only get one integer
+        syn_count=$(netstat -ant 2>/dev/null | grep -c "SYN_RECV" | head -n1)
+            : "${syn_count:=0}" # Default to 0 if empty
+            if [ "$syn_count" -gt 20 ]; then
+                printf "\n  ${RED}${BOLD}${BLINK}⚠ SYN FLOOD: %s conns!${R}\n" "$syn_count"
         fi
     } > "$C1"
 
