@@ -276,42 +276,52 @@ while true; do
 
 
 # RIGHT — MySQL
-    {
-        printf "${MAGENTA}${BOLD}  ▶  MYSQL ACTIVE PROCESSES${R}\n"
-        printf "  ${DGRAY}%-6s %-10s %-4s %-12s %s${R}\n" "ID" "DB" "TIME" "STATE" "QUERY"
-        printf "  ${DGRAY}%-6s %-10s %-4s %-12s %s${R}\n" "────" "──────────" "────" "────────────" "──────────────────────"
-        
-        # We fetch ID, DB, TIME, STATE, and the FULL query (INFO)
-        # We filter out Sleep to only show active threats/tasks
-        mysql_out=$(mysql -e "SELECT ID, DB, TIME, STATE, INFO 
-            FROM information_schema.PROCESSLIST 
-            WHERE COMMAND != 'Sleep' AND INFO IS NOT NULL 
-            ORDER BY TIME DESC LIMIT 8;" 2>/dev/null)
+{
+    printf "${MAGENTA}${BOLD}  ▶  MYSQL ACTIVE PROCESSES${R}\n"
+    
+    # Fetch with tab-separated output using \t as safe delimiter
+    # We use --batch --silent to get tab-separated output without borders
+    mysql_out=$(mysql --batch --silent -e "
+        SELECT 
+            ID, 
+            IFNULL(DB, 'system') AS DB, 
+            TIME, 
+            IFNULL(STATE, '') AS STATE, 
+            IFNULL(INFO, '') AS INFO 
+        FROM information_schema.PROCESSLIST 
+        WHERE COMMAND != 'Sleep' AND INFO IS NOT NULL 
+        ORDER BY TIME DESC 
+        LIMIT 8;" 2>/dev/null)
 
-        if [ -z "$mysql_out" ] || [ $(echo "$mysql_out" | wc -l) -le 1 ]; then
-            printf "  ${GRAY}${DIM}(no active queries)${R}\n"
+    if [ -z "$mysql_out" ]; then
+        printf "  ${GRAY}${DIM}(no active queries)${R}\n"
+        return
+    fi
+
+    echo "$mysql_out" | while IFS=$'\t' read -r id db time state query; do
+        # Skip header row if present
+        [[ "$id" == "ID" ]] && continue
+
+        # Color time: red if > 5s, orange otherwise
+        if [ "$time" -gt 5 ] 2>/dev/null; then
+            tc="\033[38;5;196m"
         else
-            # Logic: We use \t as a delimiter to handle spaces within the Query text
-            echo "$mysql_out" | awk 'NR>1 {
-                id=$1; db=$2; time=$3; 
-                
-                # Handle Database NULLs
-                if (db == "NULL") db = "system";
-                
-                # Color time: Red if query > 5s
-                tc = (time > 5) ? "\033[38;5;196m" : "\033[38;5;214m";
-
-                # The Query content starts at column 5 and goes to the end
-                query=""; for(i=5;i<=NF;i++) query=query $i " ";
-                
-                # State: we take the 4th column but truncate it to keep the table clean
-                state=$4;
-
-                printf "  \033[38;5;244m%-6s\033[0m \033[38;5;82m%-10.10s\033[0m %s%-4s\033[0m \033[38;5;45m%-12.12s\033[0m \033[38;5;255m%.45s\033[0m\n",
-                    id, db, tc, time"s", state, query
-            }'
+            tc="\033[38;5;214m"
         fi
-    } > "$C2"
+
+        # Print the summary header line for this process
+        printf "  \033[38;5;244m%-8s\033[0m \033[38;5;82m%-20s\033[0m ${tc}%-6s\033[0m \033[38;5;45m%s\033[0m\n" \
+            "$id" "$db" "${time}s" "$state"
+
+        # Print the full query, word-wrapped at 100 chars with indentation
+        printf "\033[38;5;255m%s\033[0m\n" "$query" | fold -s -w 100 | while IFS= read -r line; do
+            printf "    \033[38;5;240m│\033[0m \033[38;5;255m%s\033[0m\n" "$line"
+        done
+
+        # Separator between processes
+        printf "  \033[38;5;237m%s\033[0m\n" "$(printf '─%.0s' {1..105})"
+    done
+} > "$C2"
 
     render_two_cols "$C1" "$C2"
     rm -f "$C1" "$C2"
