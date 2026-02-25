@@ -71,9 +71,10 @@ COL_VEL_IP=28      # ip
 COL_VEL_STATUS=8   # status
 
 COL_FC_DOM=20      # file change domain
-COL_FC_TYPE=8      # plugin/theme
-COL_FC_FILE=30     # filename
-# last modified gets the remainder
+COL_FC_TYPE=7      # plugin/theme label
+COL_FC_COUNT=6     # number of files changed
+COL_FC_PLUGIN=28   # plugin or theme folder name
+# last modified (most recent) gets the remainder
 
 # MySQL full-width query wrap (full width minus indent and border char)
 COL_MYSQL_ID=8
@@ -504,45 +505,66 @@ while true; do
 
         if (( CUR_TIME - LAST_FILE_SCAN > SCAN_INTERVAL )); then
 
+            # Pass 1 — collect every changed file into a flat tsv:
+            #   domain <TAB> type <TAB> plugin <TAB> mod_datetime
             find /home/nginx/domains/*/public/wp-content/{plugins,themes} \
                 -maxdepth 3 -mmin -1440 -type f \
                 \( -name "*.php" -o -name "*.js" \) 2>/dev/null \
             | while IFS= read -r filepath; do
-                dom=$(echo  "$filepath" | cut -d'/' -f5)
+                dom=$(echo   "$filepath" | cut -d'/' -f5)
                 ftype=$(echo "$filepath" | cut -d'/' -f8)
-                file=$(basename "$filepath")
-
-                # Full timestamp, microseconds stripped
-                mod_time=$(stat -c "%y" "$filepath" 2>/dev/null | cut -d'.' -f1)
-                mod_date=$(echo "$mod_time" | cut -d' ' -f1)
-                mod_hour=$(echo "$mod_time" | cut -d' ' -f2)
-
-                if [ "$ftype" = "plugins" ]; then
-                    t_col="\033[38;5;45m"; t_label="Plugin"
-                else
-                    t_col="\033[38;5;171m"; t_label="Theme"
-                fi
-
-                printf "  \033[38;5;114m%-${COL_FC_DOM}.${COL_FC_DOM}s\033[0m ${t_col}%-${COL_FC_TYPE}s\033[0m \033[38;5;255m%-${COL_FC_FILE}.${COL_FC_FILE}s\033[0m \033[38;5;244m%s %s\033[0m\n" \
-                    "$dom" "$t_label" "$file" "$mod_date" "$mod_hour"
+                plugin=$(echo "$filepath" | cut -d'/' -f9)
+                mod=$(stat -c "%y" "$filepath" 2>/dev/null | cut -d'.' -f1)
+                printf "%s\t%s\t%s\t%s\n" "$dom" "$ftype" "$plugin" "$mod"
             done \
-            | sort -k5,5r -k6,6r \
-            | head -8 > "$FILE_CACHE"
+            | awk -F'\t' '
+            {
+                key = $1 "\t" $2 "\t" $3    # domain + type + plugin name
+                count[key]++
+                # keep the latest mod time per plugin
+                if ($4 > latest[key]) latest[key] = $4
+            }
+            END {
+                for (k in count) {
+                    split(k, p, "\t")
+                    # p[1]=domain  p[2]=type  p[3]=plugin
+                    printf "%s\t%s\t%s\t%d\t%s\n", p[1], p[2], p[3], count[k], latest[k]
+                }
+            }' \
+            | sort -t$'\t' -k5,5r \
+            | head -12 > "$FILE_CACHE"
 
             LAST_FILE_SCAN=$CUR_TIME
         fi
 
         printf "${ORANGE}${BOLD}  ▶  FILE CHANGES (Last 24h — Scanned every 15m)${R}\n"
-        printf "  ${DGRAY}%-${COL_FC_DOM}s %-${COL_FC_TYPE}s %-${COL_FC_FILE}s %s${R}\n" \
-            "DOMAIN" "TYPE" "FILE" "LAST MODIFIED"
-        printf "  ${DGRAY}%-${COL_FC_DOM}s %-${COL_FC_TYPE}s %-${COL_FC_FILE}s %s${R}\n" \
+        printf "  ${DGRAY}%-${COL_FC_DOM}s %-${COL_FC_TYPE}s %-${COL_FC_COUNT}s %-${COL_FC_PLUGIN}s %s${R}\n" \
+            "DOMAIN" "TYPE" "FILES" "PLUGIN / THEME" "LAST MODIFIED"
+        printf "  ${DGRAY}%-${COL_FC_DOM}s %-${COL_FC_TYPE}s %-${COL_FC_COUNT}s %-${COL_FC_PLUGIN}s %s${R}\n" \
             "$(printf '─%.0s' $(seq 1 $COL_FC_DOM))" \
             "$(printf '─%.0s' $(seq 1 $COL_FC_TYPE))" \
-            "$(printf '─%.0s' $(seq 1 $COL_FC_FILE))" \
+            "$(printf '─%.0s' $(seq 1 $COL_FC_COUNT))" \
+            "$(printf '─%.0s' $(seq 1 $COL_FC_PLUGIN))" \
             "───────────────────"
 
         if [ -s "$FILE_CACHE" ]; then
-            cat "$FILE_CACHE"
+            while IFS=$'\t' read -r dom ftype plugin count modtime; do
+                if [ "$ftype" = "plugins" ]; then
+                    t_col="\033[38;5;45m";  t_label="Plugin"
+                else
+                    t_col="\033[38;5;171m"; t_label="Theme"
+                fi
+
+                # Colour the file count: orange if > 5 files changed, green otherwise
+                if [ "${count:-0}" -gt 5 ] 2>/dev/null; then
+                    c_col="\033[38;5;214m"
+                else
+                    c_col="\033[38;5;82m"
+                fi
+
+                printf "  \033[38;5;114m%-${COL_FC_DOM}.${COL_FC_DOM}s\033[0m ${t_col}%-${COL_FC_TYPE}s\033[0m ${c_col}%-${COL_FC_COUNT}s\033[0m \033[38;5;220m%-${COL_FC_PLUGIN}.${COL_FC_PLUGIN}s\033[0m \033[38;5;244m%s\033[0m\n" \
+                    "$dom" "$t_label" "$count" "$plugin" "$modtime"
+            done < "$FILE_CACHE"
         else
             printf "  ${GRAY}${DIM}(no changes detected in the last 24h)${R}\n"
         fi
