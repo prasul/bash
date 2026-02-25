@@ -439,41 +439,67 @@ while true; do
     fi
     } > "$C1"
     
-    # ════════════════════════════════════════════
-    #  BLOCK 6: RECENT FILE CHANGES (Cached)
-    # ════════════════════════════════════════════
-    {
-        CUR_TIME=$(date +%s)
-        
-        # Only run the heavy 'find' command if the interval has passed
-        if (( CUR_TIME - LAST_FILE_SCAN > SCAN_INTERVAL )); then
-            # Perform the scan and save to cache
-            find /home/nginx/domains/*/public/wp-content/{plugins,themes} -maxdepth 3 -mmin -1440 -type f \( -name "*.php" -o -name "*.js" \) 2>/dev/null | awk -F'/' '{
-                dom=$5; type=$8; name=$9;
-                cmd = "stat -c %y " $0;
-                cmd | getline mod_time; close(cmd);
-                split(mod_time, t, " ");
-                
-                if (type == "plugins") { t_col="\033[38;5;45m"; t_label="Plugin"; }
-                else { t_color="\033[38;5;171m"; t_label="Theme"; }
+# ════════════════════════════════════════════
+#  BLOCK 6: RECENT FILE CHANGES (Cached)
+# ════════════════════════════════════════════
+{
+    CUR_TIME=$(date +%s)
+    
+    if (( CUR_TIME - LAST_FILE_SCAN > SCAN_INTERVAL )); then
 
-                printf "  \033[38;5;114m%-18.18s\033[0m %b%-12s\033[0m \033[38;5;255m%-15.15s\033[0m \033[38;5;244m%s\033[0m\n", 
-                    dom, t_col, t_label, name, t[2]
-            }' | sort -u | head -8 > "$FILE_CACHE"
-            
-            LAST_FILE_SCAN=$CUR_TIME
-        fi
+        find /home/nginx/domains/*/public/wp-content/{plugins,themes} -maxdepth 3 -mmin -1440 -type f \( -name "*.php" -o -name "*.js" \) 2>/dev/null \
+        | awk -F'/' '
+        {
+            dom=$5; type=$8; name=$9;
 
-        printf "${ORANGE}${BOLD}  ▶  FILE CHANGES (Last 24h - Scanned every 15m)${R}\n"
-        printf "  ${DGRAY}%-18s %-12s %-15s %s${R}\n" "DOMAIN" "TYPE" "NAME" "TIME"
-        printf "  ${DGRAY}%-18s %-12s %-15s %s${R}\n" "────────────────" "────────" "─────────────" "────────"
-        
-        if [ -s "$FILE_CACHE" ]; then
-            cat "$FILE_CACHE"
-        else
-            printf "  ${GRAY}${DIM}(no changes detected in the last 24h)${R}\n"
-        fi
-    } > "$C2"
+            # Get modification time via stat
+            cmd = "stat -c %y " $0;
+            cmd | getline mod_time; close(cmd);
+            split(mod_time, t, " ");
+            mod = t[2];
+
+            # Build a unique key: domain + type + plugin/theme name
+            key = dom "|" type "|" name;
+
+            # Only keep the LATEST modification time per key
+            if (!(key in seen) || mod > latest[key]) {
+                seen[key]   = 1;
+                latest[key] = mod;
+                domain[key] = dom;
+                ptype[key]  = type;
+                pname[key]  = name;
+            }
+        }
+        END {
+            for (key in seen) {
+                type = ptype[key];
+                if (type == "plugins") {
+                    t_col   = "\033[38;5;45m";
+                    t_label = "Plugin";
+                } else {
+                    t_col   = "\033[38;5;171m";
+                    t_label = "Theme";
+                }
+                printf "  \033[38;5;114m%-18.18s\033[0m %b%-12s\033[0m \033[38;5;255m%-20.20s\033[0m \033[38;5;244m%s\033[0m\n",
+                    domain[key], t_col, t_label, pname[key], latest[key];
+            }
+        }' \
+        | sort -t' ' -k5 -r \
+        | head -8 > "$FILE_CACHE"
+
+        LAST_FILE_SCAN=$CUR_TIME
+    fi
+
+    printf "${ORANGE}${BOLD}  ▶  FILE CHANGES (Last 24h - Scanned every 15m)${R}\n"
+    printf "  ${DGRAY}%-18s %-12s %-20s %s${R}\n" "DOMAIN" "TYPE" "NAME" "TIME"
+    printf "  ${DGRAY}%-18s %-12s %-20s %s${R}\n" "──────────────────" "────────────" "────────────────────" "────────"
+
+    if [ -s "$FILE_CACHE" ]; then
+        cat "$FILE_CACHE"
+    else
+        printf "  ${GRAY}${DIM}(no changes detected in the last 24h)${R}\n"
+    fi
+} > "$C2"
 
     render_two_cols "$C1" "$C2"
     rm -f "$C1" "$C2"
