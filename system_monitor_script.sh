@@ -467,9 +467,6 @@ while true; do
 
     render_two_cols "$C1" "$C2"
     rm -f "$C1" "$C2"
-
-
-
     rm -f "$NEW_LIVE_STATE"
     hline '─' "$DGRAY"
 
