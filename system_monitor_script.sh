@@ -303,7 +303,7 @@ while true; do
         # Alert label if things look bad
         if [ "$IOWAIT_PCT" -ge 50 ] || [ "$MEM_USED" -ge 95 ] || \
            [ "$DSTATE"     -ge 10 ] || [ "$OOM_COUNT" -ge 1 ]; then
-            printf "  ${BG_ALERT}${RED}${BOLD}${BLINK} ⚠ HIGH LOAD DETECTED ${R}"
+            printf "  ${BG_ALERT}${RED}${BOLD}${BLINK} ⚠ HIGH USAGE DETECTED ${R}"
         fi
         printf "\n"
 
@@ -676,7 +676,7 @@ while true; do
 
     # RIGHT — LIVE TRAFFIC VELOCITY
     {
-        printf "${CYAN}${BOLD}  ▶  LIVE TRAFFIC VELOCITY (REAL-TIME 20s WINDOW)${R}\n"
+        printf "${CYAN}${BOLD}  ▶  LIVE TRAFFIC HITS (REAL-TIME 20s WINDOW)${R}\n"
         printf "  ${DGRAY}%-${COL_VEL_HITS}s %-${COL_VEL_DOM}s %-${COL_VEL_IP}s %s${R}\n" \
             "HITS" "DOMAIN" "IP ADDRESS" "STATUS/Δ"
         printf "  ${DGRAY}%-${COL_VEL_HITS}s %-${COL_VEL_DOM}s %-${COL_VEL_IP}s %s${R}\n" \
