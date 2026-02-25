@@ -426,7 +426,42 @@ while true; do
     else
         printf "  ${GRAY}${DIM}(waiting for new traffic...)${R}\n"
     fi
+    # ════════════════════════════════════════════
+    #  BLOCK 6: RECENT FILE CHANGES (Last 60m)
+    # ════════════════════════════════════════════
+    # This block scans for modified PHP/JS files in plugins and themes
+    
+    {
+        printf "${ORANGE}${BOLD}  ▶  RECENT PLUGIN/THEME CHANGES (60m)${R}\n"
+        printf "  ${DGRAY}%-18s %-12s %-15s %s${R}\n" "DOMAIN" "TYPE" "NAME" "TIME"
+        printf "  ${DGRAY}%-18s %-12s %-15s %s${R}\n" "────────────────" "────────" "─────────────" "────────"
 
+        # Find files modified in the last 60 minutes
+        # We limit depth to avoid excessive scanning
+        recent_files=$(find /home/nginx/domains/*/public/wp-content/{plugins,themes} -maxdepth 3 -mmin -60 -type f \( -name "*.php" -o -name "*.js" \) 2>/dev/null)
+
+        if [ -z "$recent_files" ]; then
+            printf "  ${GRAY}${DIM}(no changes detected)${R}\n"
+        else
+            echo "$recent_files" | awk -F'/' '{
+                # Path parts: /home/nginx/domains/[5:DOMAIN]/public/wp-content/[8:plugins/themes]/[9:NAME]
+                dom=$5; type=$8; name=$9;
+                
+                # Get the modification time of the file
+                cmd = "stat -c %y " $0;
+                cmd | getline mod_time;
+                close(cmd);
+                split(mod_time, t, " ");
+                
+                # Clean up type name for display
+                if (type == "plugins") { t_color="\033[38;5;45m"; t_label="Plugin"; }
+                else { t_color="\033[38;5;171m"; t_label="Theme"; }
+
+                printf "  \033[38;5;114m%-18.18s\033[0m %b%-12s\033[0m \033[38;5;255m%-15.15s\033[0m \033[38;5;244m%s\033[0m\n", 
+                    dom, t_color, t_label, name, t[2]
+            }' | sort -u | head -8
+        fi
+    } > "$C1"  # Or $C2 depending on where you want it in the column layout
     rm -f "$NEW_LIVE_STATE"
     hline '─' "$DGRAY"
 
