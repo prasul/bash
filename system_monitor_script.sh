@@ -383,6 +383,7 @@ while true; do
         # ════════════════════════════════════════════
     #  BLOCK 5: LIVE TRAFFIC VELOCITY (Last 20s)
     # ════════════════════════════════════════════
+    {
     echo -e "${CYAN}${BOLD}  ▶  LIVE TRAFFIC VELOCITY (REAL-TIME 20s WINDOW)${R}"
     printf "  ${DGRAY}%-6s %-22s %-28s %s${R}\n" "HITS" "DOMAIN" "IP ADDRESS" "STATUS/Δ"
     printf "  ${DGRAY}%-6s %-22s %-28s %s${R}\n" "────" "────────────────────" "──────────────────────────" "────────"
@@ -429,6 +430,8 @@ while true; do
     else
         printf "  ${GRAY}${DIM}(waiting for new traffic...)${R}\n"
     fi
+    } > "$C1"
+    
     # ════════════════════════════════════════════
     #  BLOCK 6: RECENT FILE CHANGES (Cached)
     # ════════════════════════════════════════════
@@ -463,7 +466,8 @@ while true; do
         else
             printf "  ${GRAY}${DIM}(no changes detected in the last 24h)${R}\n"
         fi
-    } > "$C1"
+    } > "$C2"
+
     rm -f "$NEW_LIVE_STATE"
     hline '─' "$DGRAY"
 
