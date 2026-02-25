@@ -575,6 +575,147 @@ while true; do
 
     render_two_cols "$C1" "$C2"
     rm -f "$C1" "$C2"
+
+    # ════════════════════════════════════════════
+    #  BLOCK 7: NGINX ERROR LOG MONITOR — FULL WIDTH
+    #
+    #  Reads the last 200 lines of each domain's
+    #  error.log, groups by error type + request,
+    #  shows delta (+N) vs previous refresh cycle,
+    #  and highlights the client IP and snippet.
+    # ════════════════════════════════════════════
+    {
+        # Compute snippet column width from what's left after fixed columns
+        COL_ERR_SNIPPET=$(( TW - COL_ERR_DOM - COL_ERR_TIME - COL_ERR_DELTA - COL_ERR_CLIENT - COL_ERR_REQ - 16 ))
+        [ "$COL_ERR_SNIPPET" -lt 30 ] && COL_ERR_SNIPPET=30
+
+        printf "${RED_S}${BOLD}  ▶  NGINX ERROR LOG MONITOR${R}\n"
+        printf "  ${DGRAY}%-${COL_ERR_DOM}s %-${COL_ERR_TIME}s %-${COL_ERR_DELTA}s %-${COL_ERR_CLIENT}s %-${COL_ERR_REQ}s %s${R}\n" \
+            "DOMAIN" "LAST SEEN" "Δ NEW" "CLIENT IP" "REQUEST" "ERROR SNIPPET"
+        printf "  ${DGRAY}%-${COL_ERR_DOM}s %-${COL_ERR_TIME}s %-${COL_ERR_DELTA}s %-${COL_ERR_CLIENT}s %-${COL_ERR_REQ}s %s${R}\n" \
+            "$(printf '─%.0s' $(seq 1 $COL_ERR_DOM))" \
+            "$(printf '─%.0s' $(seq 1 $COL_ERR_TIME))" \
+            "──────" \
+            "$(printf '─%.0s' $(seq 1 $COL_ERR_CLIENT))" \
+            "$(printf '─%.0s' $(seq 1 $COL_ERR_REQ))" \
+            "$(printf '─%.0s' $(seq 1 $COL_ERR_SNIPPET))"
+
+        NEW_ERR_STATE=$(mktemp)
+        found_any=0
+
+        for errlog in $ERRORLOG_PATH; do
+            [ -f "$errlog" ] || continue
+
+            # Extract domain from path: /home/nginx/domains/DOMAIN/log/error.log
+            domain=$(echo "$errlog" | cut -d'/' -f5)
+
+            # Parse the last 200 lines — each line format:
+            # 2026/02/25 00:11:51 [error] PID#TID: *ID MESSAGE, client: IP, server: DOMAIN, request: "METHOD PATH PROTO", host: "HOST"
+            tail -n 200 "$errlog" 2>/dev/null | awk '
+            /\[error\]/ {
+                # ── Timestamp ──────────────────────────────────
+                ts = $1 " " $2
+
+                # ── Error snippet: everything after the *ID ────
+                # Field 5 onwards is the message; strip the *NNN prefix
+                snippet = ""
+                for (i=5; i<=NF; i++) snippet = snippet " " $i
+                sub(/^ \*[0-9]+ /, "", snippet)
+
+                # ── Client IP ──────────────────────────────────
+                client = ""
+                if (match(snippet, /client: ([0-9.]+|[0-9a-f:]+)/, arr)) {
+                    client = arr[1]
+                } else {
+                    # fallback: find "client: X.X.X.X" manually
+                    n = split(snippet, parts, ", ")
+                    for (j=1; j<=n; j++) {
+                        if (parts[j] ~ /^client:/) { client = parts[j]; sub(/^client: /,"",client); break }
+                    }
+                }
+
+                # ── Request path ───────────────────────────────
+                req = ""
+                if (match(snippet, /request: "([^"]+)"/, arr2)) {
+                    req = arr2[1]
+                    # trim to METHOD + PATH only, drop HTTP version
+                    sub(/ HTTP\/[0-9.]+$/, "", req)
+                } else {
+                    n2 = split(snippet, parts2, ", ")
+                    for (j2=1; j2<=n2; j2++) {
+                        if (parts2[j2] ~ /^request:/) { req = parts2[j2]; sub(/^request: "/,"",req); sub(/"$/,"",req); break }
+                    }
+                }
+
+                # ── Core error message (strip trailing metadata) ─
+                core = snippet
+                sub(/, client:.*$/, "", core)
+                gsub(/^[ \t]+|[ \t]+$/, "", core)
+
+                # ── Key: domain + core error (dedup similar errors) ─
+                key = client "|" req "|" core
+                if (!(key in seen)) {
+                    seen[key] = 1
+                    latest_ts[key] = ts
+                    client_ip[key]  = client
+                    request[key]    = req
+                    message[key]    = core
+                } else {
+                    if (ts > latest_ts[key]) latest_ts[key] = ts
+                }
+                total[key]++
+            }
+            END {
+                for (k in seen) {
+                    printf "%s\t%s\t%d\t%s\t%s\n", latest_ts[k], client_ip[k], total[k], request[k], message[k]
+                }
+            }' | sort -t$'\t' -k1,1r | head -6 | \
+            while IFS=$'\t' read -r ts client cnt req msg; do
+                found_any=1
+
+                # Build state key for delta calculation
+                state_key="${domain}|${client}|${req}"
+                echo "${state_key}=${cnt}" >> "$NEW_ERR_STATE"
+
+                # Delta vs last refresh
+                prev_cnt=$(grep "^${state_key}=" "$ERRLOG_STATE" 2>/dev/null | cut -d'=' -f2)
+                if [ -n "$prev_cnt" ] && [ "$prev_cnt" -ne "$cnt" ] 2>/dev/null; then
+                    diff=$(( cnt - prev_cnt ))
+                    if [ "$diff" -gt 0 ]; then
+                        delta="${RED}${BOLD}+${diff}${R}"
+                        age_label="${RED}${BOLD}NEW${R}"
+                    else
+                        delta="${GREEN_S}${diff}${R}"
+                        age_label="${GRAY}OLD${R}"
+                    fi
+                elif [ -z "$prev_cnt" ]; then
+                    delta="${ORANGE}${BOLD}NEW${R}"
+                    age_label="${ORANGE}${BOLD}NEW${R}"
+                else
+                    delta="${DGRAY}—${R}"
+                    age_label="${DGRAY}—${R}"
+                fi
+
+                # Truncate message to snippet column width
+                msg_short="${msg:0:$COL_ERR_SNIPPET}"
+
+                printf "  \033[38;5;114m%-${COL_ERR_DOM}.${COL_ERR_DOM}s\033[0m" "$domain"
+                printf " \033[38;5;244m%-${COL_ERR_TIME}.${COL_ERR_TIME}s\033[0m" "$ts"
+                printf " %-${COL_ERR_DELTA}b" "$delta"
+                printf " \033[38;5;203m%-${COL_ERR_CLIENT}.${COL_ERR_CLIENT}s\033[0m" "$client"
+                printf " \033[38;5;45m%-${COL_ERR_REQ}.${COL_ERR_REQ}s\033[0m" "$req"
+                printf " \033[38;5;255m%s\033[0m\n" "$msg_short"
+            done
+        done
+
+        # Rotate state file so next refresh has fresh deltas
+        [ -s "$NEW_ERR_STATE" ] && mv "$NEW_ERR_STATE" "$ERRLOG_STATE" || rm -f "$NEW_ERR_STATE"
+
+        if [ "$found_any" -eq 0 ]; then
+            printf "  ${GREEN_S}${DIM}(no errors found in nginx logs)${R}\n"
+        fi
+    }
+    
     hline '─' "$DGRAY"
 
     # ── FOOTER ───────────────────────────────────
