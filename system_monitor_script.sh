@@ -174,9 +174,13 @@ render_two_cols() {
 }
 
 # ════════════════════════════════════════════════
+FRAME=$(mktemp)
 while true; do
-    clear
 
+    # ── All output goes into $FRAME first ────────
+    # clear + cat happen together at the end so the
+    # terminal never shows a partial/scrolling render
+    {
     NOW=$(date "+%A, %d %b %Y  %H:%M:%S")
     HOST=$(hostname -s 2>/dev/null || echo "server")
     UPTIME_STR=$(uptime -p 2>/dev/null | sed 's/up //' || uptime | awk '{print $3,$4}' | tr -d ',')
@@ -303,7 +307,7 @@ while true; do
         # Alert label if things look bad
         if [ "$IOWAIT_PCT" -ge 50 ] || [ "$MEM_USED" -ge 95 ] || \
            [ "$DSTATE"     -ge 10 ] || [ "$OOM_COUNT" -ge 1 ]; then
-            printf "  ${BG_ALERT}${RED}${BOLD}${BLINK} ⚠ HIGH USAGE DETECTED ${R}"
+            printf "  ${BG_ALERT}${RED}${BOLD}${BLINK} ⚠ HIGH LOAD DETECTED ${R}"
         fi
         printf "\n"
 
@@ -676,7 +680,7 @@ while true; do
 
     # RIGHT — LIVE TRAFFIC VELOCITY
     {
-        printf "${CYAN}${BOLD}  ▶  LIVE TRAFFIC HITS (REAL-TIME 20s WINDOW)${R}\n"
+        printf "${CYAN}${BOLD}  ▶  LIVE TRAFFIC VELOCITY (REAL-TIME 20s WINDOW)${R}\n"
         printf "  ${DGRAY}%-${COL_VEL_HITS}s %-${COL_VEL_DOM}s %-${COL_VEL_IP}s %s${R}\n" \
             "HITS" "DOMAIN" "IP ADDRESS" "STATUS/Δ"
         printf "  ${DGRAY}%-${COL_VEL_HITS}s %-${COL_VEL_DOM}s %-${COL_VEL_IP}s %s${R}\n" \
@@ -1091,5 +1095,13 @@ while true; do
     hline '═' "$BLUE_D"
     printf "\n"
 
+    } > "$FRAME"
+
+    # ── Atomic render — clear and print the complete frame in one shot ──
+    # This prevents any partial output appearing during data collection
+    clear
+    cat "$FRAME"
+
     sleep 20
 done
+rm -f "$FRAME"
