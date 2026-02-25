@@ -265,23 +265,44 @@ while true; do
         fi
 
         # ── D-state (uninterruptible sleep) count ─
-        DSTATE=$(ps -eo stat 2>/dev/null | grep -c '^D' || echo 0)
+        DSTATE=$(ps -eo stat 2>/dev/null | grep -c '^D' | tr -d '[:space:]')
+        DSTATE=$(( ${DSTATE:-0} + 0 ))
 
         # ── OOM kills in last 100 dmesg lines ─────
-        OOM_COUNT=$(dmesg 2>/dev/null | tail -n 100 | grep -c "Out of memory\|oom-kill" || echo 0)
+        OOM_COUNT=$(dmesg 2>/dev/null | tail -n 100 | grep -c "Out of memory\|oom-kill" | tr -d '[:space:]')
+        OOM_COUNT=$(( ${OOM_COUNT:-0} + 0 ))
+
+        # ── Sanitize all numerics — strip newlines/spaces that break [ -ge ] ──
+        IOWAIT_PCT=$(( ${IOWAIT_PCT:-0} + 0 ))
+        MEM_USED=$(( ${MEM_USED:-0} + 0 ))
+        SWAP_IN=$(( ${SWAP_IN:-0} + 0 ))
+        SWAP_OUT=$(( ${SWAP_OUT:-0} + 0 ))
 
         # ── Colour helpers ────────────────────────
-        iowait_col="${GREEN_S}";  [ "${IOWAIT_PCT:-0}" -ge 20 ] && iowait_col="${ORANGE}";  [ "${IOWAIT_PCT:-0}" -ge 50 ] && iowait_col="${RED}${BOLD}"
-        mem_col="${GREEN_S}";     [ "${MEM_USED:-0}"   -ge 80 ] && mem_col="${ORANGE}";     [ "${MEM_USED:-0}"   -ge 95 ] && mem_col="${RED}${BOLD}"
-        swap_col="${GREEN_S}";    [ "${SWAP_OUT:-0}"   -ge 10 ] && swap_col="${ORANGE}";    [ "${SWAP_OUT:-0}"   -ge 50 ] && swap_col="${RED}${BOLD}"
-        dstate_col="${GREEN_S}";  [ "${DSTATE:-0}"     -ge 3  ] && dstate_col="${ORANGE}";  [ "${DSTATE:-0}"     -ge 10 ] && dstate_col="${RED}${BOLD}"
-        oom_col="${GREEN_S}";     [ "${OOM_COUNT:-0}"  -ge 1  ] && oom_col="${RED}${BOLD}${BLINK}"
+        iowait_col="${GREEN_S}"
+        [ "$IOWAIT_PCT" -ge 20 ] && iowait_col="${ORANGE}"
+        [ "$IOWAIT_PCT" -ge 50 ] && iowait_col="${RED}${BOLD}"
+
+        mem_col="${GREEN_S}"
+        [ "$MEM_USED" -ge 80 ] && mem_col="${ORANGE}"
+        [ "$MEM_USED" -ge 95 ] && mem_col="${RED}${BOLD}"
+
+        swap_col="${GREEN_S}"
+        [ "$SWAP_OUT" -ge 10 ] && swap_col="${ORANGE}"
+        [ "$SWAP_OUT" -ge 50 ] && swap_col="${RED}${BOLD}"
+
+        dstate_col="${GREEN_S}"
+        [ "$DSTATE" -ge 3  ] && dstate_col="${ORANGE}"
+        [ "$DSTATE" -ge 10 ] && dstate_col="${RED}${BOLD}"
+
+        oom_col="${GREEN_S}"
+        [ "$OOM_COUNT" -ge 1 ] && oom_col="${RED}${BOLD}${BLINK}"
 
         printf "${CYAN}${BOLD}  ▶  SYSTEM PRESSURE${R}"
 
         # Alert label if things look bad
-        if [ "${IOWAIT_PCT:-0}" -ge 50 ] || [ "${MEM_USED:-0}" -ge 95 ] || \
-           [ "${DSTATE:-0}" -ge 10 ]     || [ "${OOM_COUNT:-0}" -ge 1 ]; then
+        if [ "$IOWAIT_PCT" -ge 50 ] || [ "$MEM_USED" -ge 95 ] || \
+           [ "$DSTATE"     -ge 10 ] || [ "$OOM_COUNT" -ge 1 ]; then
             printf "  ${BG_ALERT}${RED}${BOLD}${BLINK} ⚠ HIGH LOAD DETECTED ${R}"
         fi
         printf "\n"
