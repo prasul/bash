@@ -32,28 +32,67 @@ FILE_CACHE="/tmp/recent_file_changes.cache"
 LAST_FILE_SCAN=0
 SCAN_INTERVAL=900  # 900 seconds = 15 minutes
 
-# ── Terminal dimensions ──────────────────────────
+# ══════════════════════════════════════════════════════
+#  LAYOUT CONFIG — all column math in one place
+#  Change numbers here and everything adjusts globally
+# ══════════════════════════════════════════════════════
 TW=$(tput cols 2>/dev/null || echo 120)
 HALF=$(( TW / 2 - 1 ))
-COL_INNER=$(( HALF - 4 ))   # usable text width inside each column
+
+# Two-column layout widths (must fit inside HALF)
+COL_PROC_N=4       # process rank number
+COL_PROC_NAME=26   # process name
+COL_PROC_PCT=6     # cpu/mem %
+
+COL_NET_STATE=24   # network state
+COL_NET_COUNT=6    # connection count
+
+COL_IP_HITS=10     # ip hit count
+COL_IP_ADDR=28     # ip address
+COL_IP_DELTA=8     # delta indicator
+
+COL_URL_HITS=8     # url hit count
+COL_URL_DOM=22     # domain
+COL_URL_PATH=28    # url path
+
+COL_WL_HITS=6      # wp-login hits
+COL_WL_DOM=22      # domain
+COL_WL_IP=26       # ip
+COL_WL_METHOD=8    # method
+COL_WL_TIME=14     # timestamp
+
+COL_SLOW_COUNT=8   # slowlog count
+COL_SLOW_DOM=26    # domain
+COL_SLOW_PLUGIN=22 # plugin name
+
+COL_VEL_HITS=6     # velocity hits
+COL_VEL_DOM=22     # domain
+COL_VEL_IP=28      # ip
+COL_VEL_STATUS=8   # status
+
+COL_FC_DOM=20      # file change domain
+COL_FC_TYPE=8      # plugin/theme
+COL_FC_FILE=30     # filename
+# last modified gets the remainder
+
+# MySQL full-width query wrap (full width minus indent and border char)
+COL_MYSQL_ID=8
+COL_MYSQL_DB=22
+COL_MYSQL_TIME=6
+COL_MYSQL_STATE=16
+COL_MYSQL_QUERY=$(( TW - COL_MYSQL_ID - COL_MYSQL_DB - COL_MYSQL_TIME - COL_MYSQL_STATE - 10 ))
+[ "$COL_MYSQL_QUERY" -lt 40 ] && COL_MYSQL_QUERY=40
 
 # ── Full-width line ───────────────────────────────
-#hline() {
-#    local char="${1:- }" color="${2:-$DGRAY}"
-#    printf "${color}"; printf '%*s' "$TW" '' | tr ' ' "$char"; printf "${R}\n"
-#}
-
 hline() {
     local char="${1:- }" color="${2:-$DGRAY}"
     local line=""
-    # Build the line based on terminal width
     for ((i=0; i<TW; i++)); do line+="$char"; done
     printf "${color}%s${R}\n" "$line"
 }
 
 # ── Column divider character ──────────────────────
-#VBAR="${DGRAY}│${R}"
-VBAR="${DGRAY}|${R}"  # Use standard | instead of Unicode │
+VBAR="${DGRAY}|${R}"
 
 # ── Color a percentage value (integer-safe) ───────
 color_pct() {
@@ -64,15 +103,15 @@ color_pct() {
     fi
 }
 
-# ═══════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 # render_two_cols FILE_LEFT FILE_RIGHT
 #   Merges two files side-by-side, ANSI-aware padding
-# ═══════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
 render_two_cols() {
     local left="$1" right="$2"
     local col_w="$HALF"
 
-    awk -v col="$col_w" -v vbar="${DGRAY}│${R}" '
+    awk -v col="$col_w" '
     function strip(s,    r) {
         r = s
         while (match(r, /\033\[[0-9;]*m/)) {
@@ -86,10 +125,8 @@ render_two_cols() {
         if (spaces < 0) spaces = 0
         return s sprintf("%" spaces "s", "")
     }
-    BEGIN {
-        i = 0; j = 0
-    }
-    FILENAME == ARGV[1] { left[++i] = $0; next }
+    BEGIN { i = 0; j = 0 }
+    FILENAME == ARGV[1] { left[++i]  = $0; next }
     FILENAME == ARGV[2] { right[++j] = $0 }
     END {
         n = (i > j) ? i : j
@@ -111,6 +148,19 @@ while true; do
     UPTIME_STR=$(uptime -p 2>/dev/null | sed 's/up //' || uptime | awk '{print $3,$4}' | tr -d ',')
     LOAD_AVG=$(uptime | awk -F'load average:' '{print $2}' | xargs)
 
+    # ══════════════════════════════════════════════
+    #  DISK WARNING — check before header renders
+    #  Shows a full-width alert banner if any mount
+    #  is at or above 98% used
+    # ══════════════════════════════════════════════
+    DISK_WARN=""
+    while read -r pct mount; do
+        pct_num="${pct%%%}"   # strip the % sign
+        if [ "${pct_num:-0}" -ge 98 ] 2>/dev/null; then
+            DISK_WARN="${DISK_WARN}${mount} at ${pct}  "
+        fi
+    done < <(df -h --output=pcent,target 2>/dev/null | awk 'NR>1 && $1!="Use%"')
+
     # ── HEADER ───────────────────────────────────
     hline '═' "$BLUE_D"
     hdr_left="  🖥  SYSTEM MONITOR DASHBOARD"
@@ -118,6 +168,19 @@ while true; do
     [ "$pad" -lt 1 ] && pad=1
     printf "${BG_HEADER}${CYAN}${BOLD}%s%*s${YELLOW}%s  ${R}\n" "$hdr_left" "$pad" "" "$NOW"
     hline '═' "$BLUE_D"
+
+    # ── DISK WARNING BANNER (shown only when triggered) ──
+    if [ -n "$DISK_WARN" ]; then
+        hline '█' "$BG_ALERT"
+        # Center the warning text
+        warn_txt="  ⚠  CRITICAL DISK USAGE:  ${DISK_WARN}"
+        warn_pad=$(( (TW - ${#warn_txt}) / 2 ))
+        [ "$warn_pad" -lt 0 ] && warn_pad=0
+        printf "${BG_ALERT}${RED}${BOLD}${BLINK}%*s%s%*s${R}\n" \
+            "$warn_pad" "" "$warn_txt" "$warn_pad" ""
+        hline '█' "$BG_ALERT"
+    fi
+
     printf "\n"
     printf "  ${DGRAY}◆ HOST:${R}  ${WHITE}${BOLD}%-24s${R}  " "$HOST"
     printf "${DGRAY}◆ UPTIME:${R} ${WHITE}${BOLD}%-26s${R}  " "$UPTIME_STR"
@@ -132,28 +195,30 @@ while true; do
     # LEFT — CPU
     {
         printf "${YELLOW}${BOLD}  ▶  TOP CPU PROCESSES${R}\n"
-        printf "  ${DGRAY}%-4s %-26s %s${R}\n" "#" "PROCESS" "CPU%"
-        printf "  ${DGRAY}%-4s %-26s %s${R}\n" "──" "─────────────────────────" "────"
+        printf "  ${DGRAY}%-${COL_PROC_N}s %-${COL_PROC_NAME}s %s${R}\n" "#" "PROCESS" "CPU%"
+        printf "  ${DGRAY}%-${COL_PROC_N}s %-${COL_PROC_NAME}s %s${R}\n" "──" "─────────────────────────" "────"
         n=0
         ps -eo comm,%cpu --sort=-%cpu 2>/dev/null | awk 'NR>1&&NR<=7{print $1,$2}' | \
         while read -r proc pct; do
             n=$((n+1))
             pc=$(color_pct "$pct" 50 20)
-            printf "  ${GRAY}%2d${R}  ${WHITE}%-26.26s${R}  ${pc}%s%%${R}\n" "$n" "$proc" "$pct"
+            printf "  ${GRAY}%2d${R}  ${WHITE}%-${COL_PROC_NAME}.${COL_PROC_NAME}s${R}  ${pc}%s%%${R}\n" \
+                "$n" "$proc" "$pct"
         done
     } > "$C1"
 
     # RIGHT — Memory
     {
         printf "${YELLOW}${BOLD}  ▶  TOP MEMORY PROCESSES${R}\n"
-        printf "  ${DGRAY}%-4s %-26s %s${R}\n" "#" "PROCESS" "MEM%"
-        printf "  ${DGRAY}%-4s %-26s %s${R}\n" "──" "─────────────────────────" "────"
+        printf "  ${DGRAY}%-${COL_PROC_N}s %-${COL_PROC_NAME}s %s${R}\n" "#" "PROCESS" "MEM%"
+        printf "  ${DGRAY}%-${COL_PROC_N}s %-${COL_PROC_NAME}s %s${R}\n" "──" "─────────────────────────" "────"
         m=0
         ps -eo comm,%mem --sort=-%mem 2>/dev/null | awk 'NR>1&&NR<=7{print $1,$2}' | \
         while read -r proc pct; do
             m=$((m+1))
             mc=$(color_pct "$pct" 20 10)
-            printf "  ${GRAY}%2d${R}  ${WHITE}%-26.26s${R}  ${mc}%s%%${R}\n" "$m" "$proc" "$pct"
+            printf "  ${GRAY}%2d${R}  ${WHITE}%-${COL_PROC_NAME}.${COL_PROC_NAME}s${R}  ${mc}%s%%${R}\n" \
+                "$m" "$proc" "$pct"
         done
     } > "$C2"
 
@@ -169,8 +234,8 @@ while true; do
     # LEFT — Network
     {
         printf "${CYAN}${BOLD}  ▶  NETWORK CONNECTIONS${R}\n"
-        printf "  ${DGRAY}%-24s %s${R}\n" "STATE" "COUNT"
-        printf "  ${DGRAY}%-24s %s${R}\n" "───────────────────────" "─────"
+        printf "  ${DGRAY}%-${COL_NET_STATE}s %s${R}\n" "STATE" "COUNT"
+        printf "  ${DGRAY}%-${COL_NET_STATE}s %s${R}\n" "───────────────────────" "─────"
         netstat -ant 2>/dev/null | awk '{print $6}' \
             | grep -v 'State\|Foreign\|^$' \
             | sort | uniq -c | sort -nr | head -8 | \
@@ -185,27 +250,21 @@ while true; do
                 FIN_WAIT*)   sc="${MAGENTA}" ;;
                 *)           sc="${GRAY}" ;;
             esac
-            printf "  ${sc}%-24s${R}  ${WHITE}%s${R}\n" "$state" "$cnt"
+            printf "  ${sc}%-${COL_NET_STATE}s${R}  ${WHITE}%s${R}\n" "$state" "$cnt"
         done
-        
-        #syn_count=$(netstat -ant 2>/dev/null | grep -c "SYN_RECV" || echo 0)
-        #if [ "${syn_count:-0}" -gt 20 ]; then
-        #    printf "\n  ${RED}${BOLD}${BLINK}⚠ SYN FLOOD: %s conns!${R}\n" "$syn_count"
-        #fi
-        
-        # We use head -n1 to ensure we only get one integer
+
         syn_count=$(netstat -ant 2>/dev/null | grep -c "SYN_RECV" | head -n1)
-            : "${syn_count:=0}" # Default to 0 if empty
-            if [ "$syn_count" -gt 20 ]; then
-                printf "\n  ${RED}${BOLD}${BLINK}⚠ SYN FLOOD: %s conns!${R}\n" "$syn_count"
+        : "${syn_count:=0}"
+        if [ "$syn_count" -gt 20 ]; then
+            printf "\n  ${RED}${BOLD}${BLINK}⚠ SYN FLOOD: %s conns!${R}\n" "$syn_count"
         fi
     } > "$C1"
 
     # RIGHT — Top IPs
     {
         printf "${CYAN}${BOLD}  ▶  TOP IPs & TRAFFIC SPIKES${R}\n"
-        printf "  ${DGRAY}%-10s %-30s %s${R}\n" "HITS" "IP ADDRESS" "Δ"
-        printf "  ${DGRAY}%-10s %-30s %s${R}\n" "────────" "────────────────────────────" "──────"
+        printf "  ${DGRAY}%-${COL_IP_HITS}s %-${COL_IP_ADDR}s %s${R}\n" "HITS" "IP ADDRESS" "Δ"
+        printf "  ${DGRAY}%-${COL_IP_HITS}s %-${COL_IP_ADDR}s %s${R}\n" "────────" "────────────────────────────" "──────"
         new_state=$(mktemp)
         awk '{print $1}' $ACCESSLOG_PATH 2>/dev/null | sort | uniq -c | sort -nr | head -8 | \
         while read -r count ip; do
@@ -222,7 +281,8 @@ while true; do
             else
                 chg="${CYAN}${BOLD}NEW${R}"
             fi
-            printf "  ${ORANGE}%-10s${R}  ${CYAN_S}%-30.30s${R}  %b\n" "$count" "$ip" "$chg"
+            printf "  ${ORANGE}%-${COL_IP_HITS}s${R}  ${CYAN_S}%-${COL_IP_ADDR}.${COL_IP_ADDR}s${R}  %b\n" \
+                "$count" "$ip" "$chg"
         done
         mv "$new_state" "$IP_STATE_FILE" 2>/dev/null
     } > "$C2"
@@ -232,15 +292,16 @@ while true; do
     hline '─' "$DGRAY"
 
     # ════════════════════════════════════════════
-    #  BLOCK 3: Top URLs (left) | MySQL (right)
+    #  BLOCK 3: Top URLs (left) | PHP Slowlog (right)
+    #  MySQL is now its own FULL-WIDTH block below
     # ════════════════════════════════════════════
     C1=$(mktemp); C2=$(mktemp)
 
     # LEFT — Top URLs
     {
         printf "${YELLOW}${BOLD}  ▶  TOP URLs BY DOMAIN${R}\n"
-        printf "  ${DGRAY}%-8s %-22s %s${R}\n" "HITS" "DOMAIN" "URL"
-        printf "  ${DGRAY}%-8s %-22s %s${R}\n" "──────" "────────────────────" "──────────────────────────"
+        printf "  ${DGRAY}%-${COL_URL_HITS}s %-${COL_URL_DOM}s %s${R}\n" "HITS" "DOMAIN" "URL"
+        printf "  ${DGRAY}%-${COL_URL_HITS}s %-${COL_URL_DOM}s %s${R}\n" "──────" "────────────────────" "──────────────────────────"
         url_temp=$(mktemp)
         for logfile in $ACCESSLOG_PATH; do
             [ -f "$logfile" ] || continue
@@ -249,86 +310,35 @@ while true; do
         done
         sort "$url_temp" | uniq -c | sort -nr | head -10 | \
         awk -v o="${ORANGE}" -v g="${GREEN_S}" -v c="${CYAN_S}" -v r="${R}" \
-            '{printf "  %s%-8s%s  %s%-22.22s%s  %s%.28s%s\n", o,$1,r, g,$2,r, c,$3,r}'
+            -v h="$COL_URL_HITS" -v d="$COL_URL_DOM" -v u="$COL_URL_PATH" \
+            '{printf "  %s%-"h"s%s  %s%-"d"."d"s%s  %s%-"u"."u"s%s\n", o,$1,r, g,$2,r, c,$3,r}'
         rm -f "$url_temp"
     } > "$C1"
 
-    # RIGHT — MySQL
-    #{
-     #   printf "${MAGENTA}${BOLD}  ▶  MYSQL ACTIVE QUERIES${R}\n"
-     #   printf "  ${DGRAY}%-8s %-18s %-12s %-6s %s${R}\n" "ID" "DATABASE" "USER" "TIME" "QUERY"
-     #   printf "  ${DGRAY}%-8s %-18s %-12s %-6s %s${R}\n" "──────" "────────────────" "──────────" "────" "──────────────────────"
-     #   mysql_out=$(mysql -e "SELECT ID, USER, DB, TIME, STATE, LEFT(INFO,80) AS QUERY
-     #       FROM information_schema.PROCESSLIST
-     #       WHERE COMMAND != 'Sleep' AND INFO IS NOT NULL
-     #       ORDER BY TIME DESC LIMIT 8;" 2>/dev/null)
-     #   if [ -z "$mysql_out" ]; then
-     #       printf "  ${GRAY}${DIM}(no active queries or not accessible)${R}\n"
-    #    else
-    #        echo "$mysql_out" | awk 'NR>1 {
-    #            id=$1; user=$2; db=$3; t=$4;
-     #           q=""; for(i=6;i<=NF;i++) q=q" "$i;
-    #            printf "  \033[38;5;244m%-8s\033[0m \033[38;5;82m%-18s\033[0m \033[38;5;45m%-12s\033[0m \033[38;5;214m%-6s\033[0m \033[38;5;255m%.30s\033[0m\n",
-    ##                id, db, user, t, q
-     #       }'
-     #   fi
-    #} > "$C2"
-
-
-# RIGHT — MySQL
-{
-    printf "${MAGENTA}${BOLD}  ▶  MYSQL ACTIVE PROCESSES${R}\n"
-    
-    # Fetch with tab-separated output using \t as safe delimiter
-    # We use --batch --silent to get tab-separated output without borders
-    mysql_out=$(mysql --batch --silent -e "
-        SELECT 
-            ID, 
-            IFNULL(DB, 'system') AS DB, 
-            TIME, 
-            IFNULL(STATE, '') AS STATE, 
-            IFNULL(INFO, '') AS INFO 
-        FROM information_schema.PROCESSLIST 
-        WHERE COMMAND != 'Sleep' AND INFO IS NOT NULL 
-        ORDER BY TIME DESC 
-        LIMIT 8;" 2>/dev/null)
-
-    if [ -z "$mysql_out" ]; then
-        printf "  ${GRAY}${DIM}(no active queries)${R}\n"
-        return
-    fi
-
-    echo "$mysql_out" | while IFS=$'\t' read -r id db time state query; do
-        # Skip header row if present
-        [[ "$id" == "ID" ]] && continue
-
-        # Color time: red if > 5s, orange otherwise
-        if [ "$time" -gt 5 ] 2>/dev/null; then
-            tc="\033[38;5;196m"
+    # RIGHT — PHP Slowlog
+    {
+        if [ -f "$SLOWLOG" ]; then
+            printf "${RED_S}${BOLD}  ▶  PHP SLOWLOG — TOP CULPRITS${R}\n"
+            printf "  ${DGRAY}%-${COL_SLOW_COUNT}s %-${COL_SLOW_DOM}s %s${R}\n" "COUNT" "DOMAIN" "PLUGIN"
+            printf "  ${DGRAY}%-${COL_SLOW_COUNT}s %-${COL_SLOW_DOM}s %s${R}\n" "──────" "────────────────────────" "──────────────────────"
+            grep "wp-content/plugins/" "$SLOWLOG" | \
+            sed -rn 's/.*\/domains\/([^/]+)\/.*plugins\/([^/ ]+).*/\1 \2/p' | \
+            sort | uniq -c | sort -nr | head -8 | \
+            awk -v o="${ORANGE}" -v g="${GREEN_S}" -v rs="${RED_S}" -v r="${R}" \
+                -v sc="$COL_SLOW_COUNT" -v sd="$COL_SLOW_DOM" -v sp="$COL_SLOW_PLUGIN" \
+                '{printf "  %s%-"sc"s%s  %s%-"sd"."sd"s%s  %s%-"sp"."sp"s%s\n", o,$1,r, g,$2,r, rs,$3,r}'
         else
-            tc="\033[38;5;214m"
+            printf "${GRAY}${DIM}  ▶  PHP SLOWLOG${R}\n"
+            printf "  ${GRAY}${DIM}(slowlog not found at configured path)${R}\n"
         fi
-
-        # Print the summary header line for this process
-        printf "  \033[38;5;244m%-8s\033[0m \033[38;5;82m%-20s\033[0m ${tc}%-6s\033[0m \033[38;5;45m%s\033[0m\n" \
-            "$id" "$db" "${time}s" "$state"
-
-        # Print the full query, word-wrapped at 100 chars with indentation
-        printf "\033[38;5;255m%s\033[0m\n" "$query" | fold -s -w 100 | while IFS= read -r line; do
-            printf "    \033[38;5;240m│\033[0m \033[38;5;255m%s\033[0m\n" "$line"
-        done
-
-        # Separator between processes
-        printf "  \033[38;5;237m%s\033[0m\n" "$(printf '─%.0s' {1..105})"
-    done
-} > "$C2"
+    } > "$C2"
 
     render_two_cols "$C1" "$C2"
     rm -f "$C1" "$C2"
     hline '─' "$DGRAY"
 
     # ════════════════════════════════════════════
-    #  BLOCK 4: WP-Login (left) | PHP Slowlog (right)
+    #  BLOCK 4: WP-Login (left) | Live Traffic (right)
     # ════════════════════════════════════════════
     C1=$(mktemp); C2=$(mktemp)
 
@@ -337,8 +347,10 @@ while true; do
         wplogin_raw=$(grep "wp-login.php" $ACCESSLOG_PATH 2>/dev/null)
         if [ -n "$wplogin_raw" ]; then
             printf "${RED}${BOLD}${BLINK}  ⚠  WP-LOGIN.PHP DETECTED${R}\n"
-            printf "  ${DGRAY}%-6s %-22s %-28s %-8s %s${R}\n" "HITS" "DOMAIN" "IP" "METHOD" "LAST SEEN"
-            printf "  ${DGRAY}%-6s %-22s %-28s %-8s %s${R}\n" "────" "────────────────────" "──────────────────────────" "──────" "──────────────"
+            printf "  ${DGRAY}%-${COL_WL_HITS}s %-${COL_WL_DOM}s %-${COL_WL_IP}s %-${COL_WL_METHOD}s %s${R}\n" \
+                "HITS" "DOMAIN" "IP" "METHOD" "LAST SEEN"
+            printf "  ${DGRAY}%-${COL_WL_HITS}s %-${COL_WL_DOM}s %-${COL_WL_IP}s %-${COL_WL_METHOD}s %s${R}\n" \
+                "────" "────────────────────" "──────────────────────────" "──────" "──────────────"
             echo "$wplogin_raw" | awk '{
                 match($0, /access\.log:/);
                 if (RSTART > 0) {
@@ -361,7 +373,7 @@ while true; do
                 }' | sort -nr | head -8 | \
             while read -r hits domain ip method ts; do
                 [ "$method" = "POST" ] && mfmt="${RED}${BOLD}[POST]${R}" || mfmt="${GREEN_S}[GET] ${R}"
-                printf "  ${ORANGE}%-6s${R}  ${GREEN_S}%-22.22s${R}  ${CYAN_S}%-28.28s${R}  %b  ${GRAY}%s${R}\n" \
+                printf "  ${ORANGE}%-${COL_WL_HITS}s${R}  ${GREEN_S}%-${COL_WL_DOM}.${COL_WL_DOM}s${R}  ${CYAN_S}%-${COL_WL_IP}.${COL_WL_IP}s${R}  %b  ${GRAY}%s${R}\n" \
                     "$hits" "$domain" "$ip" "$mfmt" "$ts"
             done
         else
@@ -370,130 +382,180 @@ while true; do
         fi
     } > "$C1"
 
-    # RIGHT — PHP Slowlog
+    # RIGHT — LIVE TRAFFIC VELOCITY
     {
-        if [ -f "$SLOWLOG" ]; then
-            printf "${RED_S}${BOLD}  ▶  PHP SLOWLOG — TOP CULPRITS${R}\n"
-            printf "  ${DGRAY}%-8s %-26s %s${R}\n" "COUNT" "DOMAIN" "PLUGIN"
-            printf "  ${DGRAY}%-8s %-26s %s${R}\n" "──────" "────────────────────────" "──────────────────────"
-            grep "wp-content/plugins/" "$SLOWLOG" | \
-            sed -rn 's/.*\/domains\/([^/]+)\/.*plugins\/([^/ ]+).*/\1 \2/p' | \
-            sort | uniq -c | sort -nr | head -8 | \
-            awk -v o="${ORANGE}" -v g="${GREEN_S}" -v rs="${RED_S}" -v r="${R}" \
-                '{printf "  %s%-8s%s  %s%-26.26s%s  %s%s%s\n", o,$1,r, g,$2,r, rs,$3,r}'
-        else
-            printf "${GRAY}${DIM}  ▶  PHP SLOWLOG${R}\n"
-            printf "  ${GRAY}${DIM}(slowlog not found at configured path)${R}\n"
-        fi
-    } > "$C2"
+        printf "${CYAN}${BOLD}  ▶  LIVE TRAFFIC VELOCITY (REAL-TIME 20s WINDOW)${R}\n"
+        printf "  ${DGRAY}%-${COL_VEL_HITS}s %-${COL_VEL_DOM}s %-${COL_VEL_IP}s %s${R}\n" \
+            "HITS" "DOMAIN" "IP ADDRESS" "STATUS/Δ"
+        printf "  ${DGRAY}%-${COL_VEL_HITS}s %-${COL_VEL_DOM}s %-${COL_VEL_IP}s %s${R}\n" \
+            "────" "────────────────────" "──────────────────────────" "────────"
 
-        # ════════════════════════════════════════════
-    #  BLOCK 5: LIVE TRAFFIC VELOCITY (Last 20s)
-    # ════════════════════════════════════════════
-    {
-    echo -e "${CYAN}${BOLD}  ▶  LIVE TRAFFIC VELOCITY (REAL-TIME 20s WINDOW)${R}"
-    printf "  ${DGRAY}%-6s %-22s %-28s %s${R}\n" "HITS" "DOMAIN" "IP ADDRESS" "STATUS/Δ"
-    printf "  ${DGRAY}%-6s %-22s %-28s %s${R}\n" "────" "────────────────────" "──────────────────────────" "────────"
+        LIVE_STATE="/tmp/live_velocity.state"
+        NEW_LIVE_STATE=$(mktemp)
+        CUR_MIN=$(date "+%d/%b/%Y:%H:%M")
 
-    LIVE_STATE="/tmp/live_velocity.state"
-    NEW_LIVE_STATE=$(mktemp)
-
-    # 1. Capture current minute and previous minute to handle "boundary" refreshes
-    CUR_MIN=$(date "+%d/%b/%Y:%H:%M")
-
-    # 2. Loop through logs to get domain-specific live hits
-    for log in $ACCESSLOG_PATH; do
-        [ -f "$log" ] || continue
-        dom=$(echo "$log" | awk -F'/' '{print $5}')
-
-        # Filter only for the current minute to represent "Live" traffic
-        tail -n 200 "$log" | grep "$CUR_MIN" | awk -v d="$dom" '{print d, $1}' >> "$NEW_LIVE_STATE"
-    done
-
-    # 3. Aggregate, sort, and calculate Deltas
-    if [ -s "$NEW_LIVE_STATE" ]; then
-        sort "$NEW_LIVE_STATE" | uniq -c | sort -nr | head -8 | while read -r count dom ip; do
-            [ -z "$ip" ] && continue
-
-            # FIX: We use a unique key (dom+ip) to find the previous count
-            # We ensure we only grab the first column (the count) for the math
-            prev_live=$(grep "$dom $ip" "$LIVE_STATE" 2>/dev/null | awk '{print $1}')
-
-            if [ -n "$prev_live" ] && [ "$prev_live" -eq "$prev_live" ] 2>/dev/null; then
-                diff=$((count - prev_live))
-                if [ "$diff" -gt 3 ]; then v_chg="${RED}${BOLD}↑+${diff}${R}"
-                elif [ "$diff" -lt 0 ]; then v_chg="${GREEN_S}↓${diff}${R}"
-                else v_chg="${DGRAY}steady${R}"; fi
-            else
-                v_chg="${BLUE_D}ACTIVE${R}"
-            fi
-
-            printf "  ${ORANGE}%-6s${R}  ${GREEN_S}%-22.22s${R}  ${CYAN_S}%-28.28s${R}  %b\n" "$count" "$dom" "$ip" "$v_chg"
-
-            # Save for next loop comparison
-            echo "$count $dom $ip" >> "${NEW_LIVE_STATE}.final"
+        for log in $ACCESSLOG_PATH; do
+            [ -f "$log" ] || continue
+            dom=$(echo "$log" | awk -F'/' '{print $5}')
+            tail -n 200 "$log" | grep "$CUR_MIN" | awk -v d="$dom" '{print d, $1}' >> "$NEW_LIVE_STATE"
         done
-        mv "${NEW_LIVE_STATE}.final" "$LIVE_STATE" 2>/dev/null
-    else
-        printf "  ${GRAY}${DIM}(waiting for new traffic...)${R}\n"
-    fi
-    } > "$C1"
-    
-# ════════════════════════════════════════════
-#  BLOCK 6: RECENT FILE CHANGES (Cached)
-# ════════════════════════════════════════════
-{
-    CUR_TIME=$(date +%s)
-    
-    if (( CUR_TIME - LAST_FILE_SCAN > SCAN_INTERVAL )); then
 
-        find /home/nginx/domains/*/public/wp-content/{plugins,themes} -maxdepth 3 -mmin -1440 -type f \( -name "*.php" -o -name "*.js" \) 2>/dev/null \
-        | while IFS= read -r filepath; do
-            # Extract fields directly from the path
-            dom=$(echo "$filepath"  | cut -d'/' -f5)
-            type=$(echo "$filepath" | cut -d'/' -f8)
-            file=$(basename "$filepath")
-
-            # Get last modified time formatted cleanly
-            mod_time=$(stat -c "%y" "$filepath" 2>/dev/null | cut -d'.' -f1)  # strips microseconds
-            mod_date=$(echo "$mod_time" | cut -d' ' -f1)
-            mod_hour=$(echo "$mod_time" | cut -d' ' -f2)
-
-            if [ "$type" = "plugins" ]; then
-                t_col="\033[38;5;45m"
-                t_label="Plugin"
-            else
-                t_col="\033[38;5;171m"
-                t_label="Theme"
-            fi
-
-            printf "  \033[38;5;114m%-18.18s\033[0m ${t_col}%-8s\033[0m \033[38;5;255m%-30.30s\033[0m \033[38;5;244m%s %s\033[0m\n" \
-                "$dom" "$t_label" "$file" "$mod_date" "$mod_hour"
-
-        done \
-        | sort -k5,5r -k6,6r \
-        | head -8 > "$FILE_CACHE"
-
-        LAST_FILE_SCAN=$CUR_TIME
-    fi
-
-    printf "${ORANGE}${BOLD}  ▶  FILE CHANGES (Last 24h - Scanned every 15m)${R}\n"
-    printf "  ${DGRAY}%-18s %-8s %-30s %s${R}\n" "DOMAIN" "TYPE" "FILE" "LAST MODIFIED"
-    printf "  ${DGRAY}%-18s %-8s %-30s %s${R}\n" "──────────────────" "────────" "──────────────────────────────" "───────────────────"
-
-    if [ -s "$FILE_CACHE" ]; then
-        cat "$FILE_CACHE"
-    else
-        printf "  ${GRAY}${DIM}(no changes detected in the last 24h)${R}\n"
-    fi
-} > "$C2"
+        if [ -s "$NEW_LIVE_STATE" ]; then
+            sort "$NEW_LIVE_STATE" | uniq -c | sort -nr | head -8 | while read -r count dom ip; do
+                [ -z "$ip" ] && continue
+                prev_live=$(grep "$dom $ip" "$LIVE_STATE" 2>/dev/null | awk '{print $1}')
+                if [ -n "$prev_live" ] && [ "$prev_live" -eq "$prev_live" ] 2>/dev/null; then
+                    diff=$((count - prev_live))
+                    if   [ "$diff" -gt 3 ]; then v_chg="${RED}${BOLD}↑+${diff}${R}"
+                    elif [ "$diff" -lt 0 ]; then v_chg="${GREEN_S}↓${diff}${R}"
+                    else v_chg="${DGRAY}steady${R}"
+                    fi
+                else
+                    v_chg="${BLUE_D}ACTIVE${R}"
+                fi
+                printf "  ${ORANGE}%-${COL_VEL_HITS}s${R}  ${GREEN_S}%-${COL_VEL_DOM}.${COL_VEL_DOM}s${R}  ${CYAN_S}%-${COL_VEL_IP}.${COL_VEL_IP}s${R}  %b\n" \
+                    "$count" "$dom" "$ip" "$v_chg"
+                echo "$count $dom $ip" >> "${NEW_LIVE_STATE}.final"
+            done
+            mv "${NEW_LIVE_STATE}.final" "$LIVE_STATE" 2>/dev/null
+        else
+            printf "  ${GRAY}${DIM}(waiting for new traffic...)${R}\n"
+        fi
+        rm -f "$NEW_LIVE_STATE"
+    } > "$C2"
 
     render_two_cols "$C1" "$C2"
     rm -f "$C1" "$C2"
-    rm -f "$NEW_LIVE_STATE"
     hline '─' "$DGRAY"
 
-        # ── FOOTER ───────────────────────────────────
+    # ════════════════════════════════════════════
+    #  BLOCK 5: MYSQL ACTIVE PROCESSES — FULL WIDTH
+    #
+    #  MySQL gets its own full-width block because
+    #  query text is too long for a half-column.
+    #  Each process shows a summary line then the
+    #  full query wrapped to terminal width.
+    # ════════════════════════════════════════════
+    {
+        printf "${MAGENTA}${BOLD}  ▶  MYSQL ACTIVE PROCESSES${R}\n"
+        printf "  ${DGRAY}%-${COL_MYSQL_ID}s %-${COL_MYSQL_DB}s %-${COL_MYSQL_TIME}s %-${COL_MYSQL_STATE}s %s${R}\n" \
+            "ID" "DATABASE" "TIME" "STATE" "QUERY PREVIEW"
+        printf "  ${DGRAY}%-${COL_MYSQL_ID}s %-${COL_MYSQL_DB}s %-${COL_MYSQL_TIME}s %-${COL_MYSQL_STATE}s %s${R}\n" \
+            "────────" "──────────────────────" "──────" "────────────────" "$(printf '─%.0s' $(seq 1 $COL_MYSQL_QUERY))"
+
+        mysql_out=$(mysql --batch --silent -e "
+            SELECT
+                ID,
+                IFNULL(DB, 'system')    AS DB,
+                TIME,
+                IFNULL(STATE, '')       AS STATE,
+                IFNULL(INFO, '')        AS INFO
+            FROM information_schema.PROCESSLIST
+            WHERE COMMAND != 'Sleep'
+              AND INFO IS NOT NULL
+            ORDER BY TIME DESC
+            LIMIT 8;" 2>/dev/null)
+
+        if [ -z "$mysql_out" ]; then
+            printf "  ${GRAY}${DIM}(no active queries)${R}\n"
+        else
+            # Use process substitution so IFS=$'\t' applies cleanly per-line
+            while IFS=$'\t' read -r id db time state query; do
+                [[ "$id" == "ID" ]] && continue
+                [ -z "$id" ]        && continue
+
+                # Time colouring: red ≥ 5s, orange otherwise
+                if [ "${time:-0}" -ge 5 ] 2>/dev/null; then
+                    tc="\033[38;5;196m"   # red
+                else
+                    tc="\033[38;5;214m"   # orange
+                fi
+
+                # ── Summary line: ID  DB  TIME  STATE ──────────────
+                printf "  \033[38;5;244m%-${COL_MYSQL_ID}s\033[0m" "$id"
+                printf " \033[38;5;82m%-${COL_MYSQL_DB}.${COL_MYSQL_DB}s\033[0m" "$db"
+                printf " ${tc}%-${COL_MYSQL_TIME}s\033[0m" "${time}s"
+                printf " \033[38;5;45m%-${COL_MYSQL_STATE}.${COL_MYSQL_STATE}s\033[0m\n" "$state"
+
+                # ── Full query, word-wrapped at COL_MYSQL_QUERY ──────
+                # Normalize whitespace: collapse newlines/tabs to single space
+                clean_query=$(echo "$query" | tr '\n\t' '  ' | tr -s ' ')
+                echo "$clean_query" | fold -s -w "$COL_MYSQL_QUERY" | \
+                while IFS= read -r qline; do
+                    printf "  \033[38;5;240m│\033[0m \033[38;5;255m%s\033[0m\n" "$qline"
+                done
+
+                # ── Per-process separator ────────────────────────────
+                printf "  \033[38;5;237m%s\033[0m\n" \
+                    "$(printf '╌%.0s' $(seq 1 $(( TW - 4 ))))"
+            done <<< "$mysql_out"
+        fi
+    }
+    hline '─' "$DGRAY"
+
+    # ════════════════════════════════════════════
+    #  BLOCK 6: FILE CHANGES (left) | (spare right)
+    #  File cache is scanned every SCAN_INTERVAL
+    # ════════════════════════════════════════════
+    C1=$(mktemp); C2=$(mktemp)
+
+    {
+        CUR_TIME=$(date +%s)
+
+        if (( CUR_TIME - LAST_FILE_SCAN > SCAN_INTERVAL )); then
+
+            find /home/nginx/domains/*/public/wp-content/{plugins,themes} \
+                -maxdepth 3 -mmin -1440 -type f \
+                \( -name "*.php" -o -name "*.js" \) 2>/dev/null \
+            | while IFS= read -r filepath; do
+                dom=$(echo  "$filepath" | cut -d'/' -f5)
+                ftype=$(echo "$filepath" | cut -d'/' -f8)
+                file=$(basename "$filepath")
+
+                # Full timestamp, microseconds stripped
+                mod_time=$(stat -c "%y" "$filepath" 2>/dev/null | cut -d'.' -f1)
+                mod_date=$(echo "$mod_time" | cut -d' ' -f1)
+                mod_hour=$(echo "$mod_time" | cut -d' ' -f2)
+
+                if [ "$ftype" = "plugins" ]; then
+                    t_col="\033[38;5;45m"; t_label="Plugin"
+                else
+                    t_col="\033[38;5;171m"; t_label="Theme"
+                fi
+
+                printf "  \033[38;5;114m%-${COL_FC_DOM}.${COL_FC_DOM}s\033[0m ${t_col}%-${COL_FC_TYPE}s\033[0m \033[38;5;255m%-${COL_FC_FILE}.${COL_FC_FILE}s\033[0m \033[38;5;244m%s %s\033[0m\n" \
+                    "$dom" "$t_label" "$file" "$mod_date" "$mod_hour"
+            done \
+            | sort -k5,5r -k6,6r \
+            | head -8 > "$FILE_CACHE"
+
+            LAST_FILE_SCAN=$CUR_TIME
+        fi
+
+        printf "${ORANGE}${BOLD}  ▶  FILE CHANGES (Last 24h — Scanned every 15m)${R}\n"
+        printf "  ${DGRAY}%-${COL_FC_DOM}s %-${COL_FC_TYPE}s %-${COL_FC_FILE}s %s${R}\n" \
+            "DOMAIN" "TYPE" "FILE" "LAST MODIFIED"
+        printf "  ${DGRAY}%-${COL_FC_DOM}s %-${COL_FC_TYPE}s %-${COL_FC_FILE}s %s${R}\n" \
+            "$(printf '─%.0s' $(seq 1 $COL_FC_DOM))" \
+            "$(printf '─%.0s' $(seq 1 $COL_FC_TYPE))" \
+            "$(printf '─%.0s' $(seq 1 $COL_FC_FILE))" \
+            "───────────────────"
+
+        if [ -s "$FILE_CACHE" ]; then
+            cat "$FILE_CACHE"
+        else
+            printf "  ${GRAY}${DIM}(no changes detected in the last 24h)${R}\n"
+        fi
+    } > "$C1"
+
+    # Right column can be used for future blocks; blank for now
+    printf "" > "$C2"
+
+    render_two_cols "$C1" "$C2"
+    rm -f "$C1" "$C2"
+    hline '─' "$DGRAY"
+
+    # ── FOOTER ───────────────────────────────────
     printf "\n"
     hline '═' "$BLUE_D"
     printf "  ${GRAY}${DIM}Refreshing in ${R}${BOLD}${CYAN}20s${R}  ${DGRAY}•${R}  ${GRAY}${DIM}Ctrl+C to exit${R}\n"
