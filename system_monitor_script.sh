@@ -377,9 +377,6 @@ while true; do
         fi
     } > "$C2"
 
-    render_two_cols "$C1" "$C2"
-    rm -f "$C1" "$C2"
-
         # ════════════════════════════════════════════
     #  BLOCK 5: LIVE TRAFFIC VELOCITY (Last 20s)
     # ════════════════════════════════════════════
@@ -467,6 +464,11 @@ while true; do
             printf "  ${GRAY}${DIM}(no changes detected in the last 24h)${R}\n"
         fi
     } > "$C2"
+
+    render_two_cols "$C1" "$C2"
+    rm -f "$C1" "$C2"
+
+
 
     rm -f "$NEW_LIVE_STATE"
     hline '─' "$DGRAY"
