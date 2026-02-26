@@ -30,7 +30,8 @@ SLOWLOG="/var/log/php-fpm/www-slow.log"
 IP_STATE_FILE="/tmp/ip_counts.state"
 touch "$IP_STATE_FILE"
 FILE_CACHE="/tmp/recent_file_changes.cache"
-LAST_FILE_SCAN=0
+FILE_SCAN_TS="/tmp/last_file_scan.ts"        # persists scan timestamp across subshell boundaries
+[ -f "$FILE_SCAN_TS" ] || echo 0 > "$FILE_SCAN_TS"
 SCAN_INTERVAL=900  # 900 seconds = 15 minutes
 ERRLOG_STATE="/tmp/nginx_error_counts.state"  # persists per-domain error counts across refreshes
 touch "$ERRLOG_STATE"
@@ -418,79 +419,33 @@ while true; do
     # ════════════════════════════════════════════
     C1=$(mktemp); C2=$(mktemp)
 
-    #FILE CHANGES — left
-
+    # LEFT — Network Connections
     {
-        CUR_TIME=$(date +%s)
-
-        if (( CUR_TIME - LAST_FILE_SCAN > SCAN_INTERVAL )); then
-
-            # Pass 1 — collect every changed file into a flat tsv:
-            #   domain <TAB> type <TAB> plugin <TAB> mod_datetime
-            find /home/nginx/domains/*/public/wp-content/{plugins,themes} \
-                -maxdepth 3 -mmin -1440 -type f \
-                \( -name "*.php" -o -name "*.js" \) 2>/dev/null \
-            | while IFS= read -r filepath; do
-                dom=$(echo   "$filepath" | cut -d'/' -f5)
-                ftype=$(echo "$filepath" | cut -d'/' -f8)
-                plugin=$(echo "$filepath" | cut -d'/' -f9)
-                mod=$(stat -c "%y" "$filepath" 2>/dev/null | cut -d'.' -f1)
-                printf "%s\t%s\t%s\t%s\n" "$dom" "$ftype" "$plugin" "$mod"
-            done \
-            | awk -F'\t' '
-            {
-                key = $1 "\t" $2 "\t" $3    # domain + type + plugin name
-                count[key]++
-                # keep the latest mod time per plugin
-                if ($4 > latest[key]) latest[key] = $4
-            }
-            END {
-                for (k in count) {
-                    split(k, p, "\t")
-                    # p[1]=domain  p[2]=type  p[3]=plugin
-                    printf "%s\t%s\t%s\t%d\t%s\n", p[1], p[2], p[3], count[k], latest[k]
-                }
-            }' \
-            | sort -t$'\t' -k5,5r \
-            | head -12 > "$FILE_CACHE"
-
-            LAST_FILE_SCAN=$CUR_TIME
-        fi
-
-        printf "${ORANGE}${BOLD}  ▶  FILE CHANGES (Last 24h — Scanned every 15m)${R}\n"
-        printf "  ${DGRAY}%-${COL_FC_DOM}s %-${COL_FC_TYPE}s %-${COL_FC_COUNT}s %-${COL_FC_PLUGIN}s %s${R}\n" \
-            "DOMAIN" "TYPE" "FILES" "PLUGIN / THEME" "LAST MODIFIED"
-        printf "  ${DGRAY}%-${COL_FC_DOM}s %-${COL_FC_TYPE}s %-${COL_FC_COUNT}s %-${COL_FC_PLUGIN}s %s${R}\n" \
-            "$(printf '─%.0s' $(seq 1 $COL_FC_DOM))" \
-            "$(printf '─%.0s' $(seq 1 $COL_FC_TYPE))" \
-            "$(printf '─%.0s' $(seq 1 $COL_FC_COUNT))" \
-            "$(printf '─%.0s' $(seq 1 $COL_FC_PLUGIN))" \
-            "───────────────────"
-
-        if [ -s "$FILE_CACHE" ]; then
-            while IFS=$'\t' read -r dom ftype plugin count modtime; do
-                if [ "$ftype" = "plugins" ]; then
-                    t_col="\033[38;5;45m";  t_label="Plugin"
-                else
-                    t_col="\033[38;5;171m"; t_label="Theme"
-                fi
-
-                # Colour the file count: orange if > 5 files changed, green otherwise
-                if [ "${count:-0}" -gt 5 ] 2>/dev/null; then
-                    c_col="\033[38;5;214m"
-                else
-                    c_col="\033[38;5;82m"
-                fi
-
-                printf "  \033[38;5;114m%-${COL_FC_DOM}.${COL_FC_DOM}s\033[0m ${t_col}%-${COL_FC_TYPE}s\033[0m ${c_col}%-${COL_FC_COUNT}s\033[0m \033[38;5;220m%-${COL_FC_PLUGIN}.${COL_FC_PLUGIN}s\033[0m \033[38;5;244m%s\033[0m\n" \
-                    "$dom" "$t_label" "$count" "$plugin" "$modtime"
-            done < "$FILE_CACHE"
-        else
-            printf "  ${GRAY}${DIM}(no changes detected in the last 24h)${R}\n"
+        printf "${CYAN}${BOLD}  ▶  NETWORK CONNECTIONS${R}\n"
+        printf "  ${DGRAY}%-${COL_NET_STATE}s %s${R}\n" "STATE" "COUNT"
+        printf "  ${DGRAY}%-${COL_NET_STATE}s %s${R}\n" "───────────────────────" "─────"
+        netstat -ant 2>/dev/null | awk '{print $6}' \
+            | grep -v 'State\|Foreign\|^$' \
+            | sort | uniq -c | sort -nr | head -8 | \
+        while read -r cnt state; do
+            [ -z "$state" ] && continue
+            case "$state" in
+                ESTABLISHED) sc="${GREEN}" ;;
+                SYN_RECV)    sc="${RED}${BOLD}" ;;
+                TIME_WAIT)   sc="${ORANGE}" ;;
+                CLOSE_WAIT)  sc="${YELLOW}" ;;
+                LISTEN)      sc="${CYAN_S}" ;;
+                FIN_WAIT*)   sc="${MAGENTA}" ;;
+                *)           sc="${GRAY}" ;;
+            esac
+            printf "  ${sc}%-${COL_NET_STATE}s${R}  ${WHITE}%s${R}\n" "$state" "$cnt"
+        done
+        syn_count=$(netstat -ant 2>/dev/null | grep -c "SYN_RECV" | tr -d '[:space:]')
+        : "${syn_count:=0}"
+        if [ "$syn_count" -gt 20 ]; then
+            printf "\n  ${RED}${BOLD}${BLINK}⚠ SYN FLOOD: %s conns!${R}\n" "$syn_count"
         fi
     } > "$C1"
-
-   
 
     # RIGHT — WP-Login
     {
@@ -504,9 +459,9 @@ while true; do
         # ── Determine if there are RECENT hits (current or prev minute) ──
         # This drives the status indicator colour — red blink if active
         # right now, green blink if clean, orange if hits exist but older
-        wplogin_recent=$(echo "$wplogin_raw" | grep -c "${WL_CUR_MIN}\|${WL_PREV_MIN}" 2>/dev/null || echo 0)
+        wplogin_recent=$(echo "$wplogin_raw" | grep -c "${WL_CUR_MIN}\|${WL_PREV_MIN}" 2>/dev/null | tr -d '[:space:]')
         wplogin_recent=$(( ${wplogin_recent:-0} + 0 ))
-        wplogin_total=$(echo "$wplogin_raw" | grep -c "wp-login" 2>/dev/null || echo 0)
+        wplogin_total=$(echo "$wplogin_raw" | grep -c "wp-login" 2>/dev/null | tr -d '[:space:]')
         wplogin_total=$(( ${wplogin_total:-0} + 0 ))
 
         # ── Status indicator: coloured blinking dot + time ────────────────
@@ -581,6 +536,172 @@ while true; do
             done
         else
             printf "  ${GREEN_S}No wp-login.php hits in access logs.${R}\n"
+        fi
+    } > "$C2"
+
+    render_two_cols "$C1" "$C2"
+    rm -f "$C1" "$C2"
+    hline '─' "$DGRAY"
+
+    # ════════════════════════════════════════════
+    #  BLOCK 4: PHP-FPM Pools (left) | MySQL Health (right)
+    # ════════════════════════════════════════════
+    C1=$(mktemp); C2=$(mktemp)
+
+    # LEFT — PHP-FPM pool status
+    # Reads /proc/net/unix to find fpm socket paths, then
+    # queries each pool's status page via cgi-fcgi.
+    # Falls back to ps worker count if unreachable.
+    {
+        printf "${CYAN}${BOLD}  ▶  PHP-FPM POOLS${R}\n"
+        printf "  ${DGRAY}%-${COL_FPM_POOL}s %-${COL_FPM_ACT}s %-${COL_FPM_IDLE}s %-${COL_FPM_MAX}s %-${COL_FPM_QUEUE}s %s${R}\n" \
+            "POOL" "ACTIVE" "IDLE" "MAX" "QUEUE" "STATUS"
+        printf "  ${DGRAY}%-${COL_FPM_POOL}s %-${COL_FPM_ACT}s %-${COL_FPM_IDLE}s %-${COL_FPM_MAX}s %-${COL_FPM_QUEUE}s %s${R}\n" \
+            "$(printf '─%.0s' $(seq 1 $COL_FPM_POOL))" "──────" "─────" "─────" "──────" "──────────"
+
+        fpm_found=0
+
+        # Method 1: query status pages via unix sockets using cgi-fcgi
+        if command -v cgi-fcgi &>/dev/null; then
+            for sock in /var/run/php*.sock /run/php/*.sock /tmp/php*.sock; do
+                [ -S "$sock" ] || continue
+                pool=$(basename "$sock" .sock | sed 's/php[0-9.-]*-fpm-\?//')
+                [ -z "$pool" ] && pool=$(basename "$sock" .sock)
+
+                status_raw=$(SCRIPT_FILENAME=/status SCRIPT_NAME=/status \
+                    REQUEST_METHOD=GET cgi-fcgi -bind -connect "$sock" 2>/dev/null)
+
+                active=$(echo "$status_raw" | grep "^active processes:"  | awk '{print $NF}')
+                idle=$(echo   "$status_raw" | grep "^idle processes:"    | awk '{print $NF}')
+                maxc=$(echo   "$status_raw" | grep "^max children reached" | awk '{print $NF}')
+                queue=$(echo  "$status_raw" | grep "^listen queue:"      | awk '{print $NF}')
+                maxq=$(echo   "$status_raw" | grep "^max listen queue:"  | awk '{print $NF}')
+
+                [ -z "$active" ] && continue
+                fpm_found=1
+
+                total=$(( ${active:-0} + ${idle:-0} ))
+                [ "$total" -eq 0 ] && total=1
+                pct=$(( ${active:-0} * 100 / total ))
+
+                if   [ "${active:-0}" -ge "${maxc:-999}" ] 2>/dev/null; then
+                    st="${RED}${BOLD}⚠ SATURATED${R}"
+                elif [ "$pct" -ge 80 ]; then
+                    st="${ORANGE}▲ HIGH${R}"
+                else
+                    st="${GREEN_S}✔ OK${R}"
+                fi
+
+                printf "  ${WHITE}%-${COL_FPM_POOL}.${COL_FPM_POOL}s${R} " "$pool"
+                printf "${ORANGE}%-${COL_FPM_ACT}s${R} "    "${active:-0}"
+                printf "${GRAY}%-${COL_FPM_IDLE}s${R} "     "${idle:-0}"
+                printf "${DGRAY}%-${COL_FPM_MAX}s${R} "     "${maxc:-?}"
+                printf "${YELLOW}%-${COL_FPM_QUEUE}s${R} "  "${queue:-0}"
+                printf "%b\n" "$st"
+            done
+        fi
+
+        # Method 2: fallback — count php-fpm worker processes via ps
+        if [ "$fpm_found" -eq 0 ]; then
+            ps -eo comm,stat 2>/dev/null | awk '
+            /php-fpm/ || /php[0-9].*-fpm/ {
+                if ($2 ~ /^S/) idle++
+                else if ($2 ~ /^R/) active++
+                total++
+            }
+            END {
+                if (total > 0) {
+                    pct = int(active*100/total)
+                    st = (pct >= 80) ? "\033[38;5;196mHIGH\033[0m" : "\033[38;5;82m✔ OK\033[0m"
+                    printf "  \033[38;5;255m%-20s\033[0m %-7s %-6s %-6s %-7s %b\n",
+                        "php-fpm", active+0, idle+0, total, "n/a", st
+                } else {
+                    print "  \033[38;5;244m(php-fpm not detected or status page unreachable)\033[0m"
+                }
+            }'
+        fi
+    } > "$C1"
+
+    # RIGHT — MySQL Health metrics
+    # Uses mysqladmin status + SHOW GLOBAL STATUS for key counters.
+    # QPS is computed as a delta against the previous refresh so it
+    # shows actual queries/sec rather than a lifetime cumulative.
+    {
+        printf "${MAGENTA}${BOLD}  ▶  MYSQL HEALTH${R}\n"
+        printf "  ${DGRAY}%-${COL_MH_LABEL}s %s${R}\n" "METRIC" "VALUE"
+        printf "  ${DGRAY}%-${COL_MH_LABEL}s %s${R}\n" "$(printf '─%.0s' $(seq 1 $COL_MH_LABEL))" "──────────────"
+
+        # Fetch all status vars in one query
+        mysql_health=$(mysql --batch --silent -e "
+            SHOW GLOBAL STATUS WHERE Variable_name IN (
+                'Threads_connected','Threads_running','max_used_connections',
+                'Questions','Slow_queries','Table_locks_waited',
+                'Innodb_buffer_pool_reads','Innodb_buffer_pool_read_requests',
+                'Innodb_row_lock_waits','Com_select','Com_insert',
+                'Com_update','Com_delete','Aborted_connects'
+            );
+            SHOW VARIABLES WHERE Variable_name = 'max_connections';" 2>/dev/null)
+
+        if [ -z "$mysql_health" ]; then
+            printf "  ${GRAY}${DIM}(mysql not accessible)${R}\n"
+        else
+            get_val() { echo "$mysql_health" | awk -v k="$1" '$1==k{print $2}'; }
+
+            threads_conn=$(get_val "Threads_connected")
+            threads_run=$(get_val  "Threads_running")
+            max_conn=$(get_val     "max_connections")
+            questions=$(get_val    "Questions")
+            slow_q=$(get_val       "Slow_queries")
+            lock_wait=$(get_val    "Table_locks_waited")
+            bp_reads=$(get_val     "Innodb_buffer_pool_reads")
+            bp_req=$(get_val       "Innodb_buffer_pool_read_requests")
+            row_locks=$(get_val    "Innodb_row_lock_waits")
+            aborted=$(get_val      "Aborted_connects")
+
+            # ── QPS delta ─────────────────────────
+            prev_q=$(cat "$MYSQL_QPS_STATE" 2>/dev/null || echo 0)
+            QPS=0
+            if [ -n "$questions" ] && [ "${prev_q:-0}" -gt 0 ] 2>/dev/null; then
+                QPS=$(( (questions - prev_q) / 20 ))   # 20s refresh interval
+                [ "$QPS" -lt 0 ] && QPS=0
+            fi
+            echo "${questions:-0}" > "$MYSQL_QPS_STATE"
+
+            # ── InnoDB buffer pool hit rate ────────
+            BP_HIT="n/a"
+            if [ -n "$bp_req" ] && [ "${bp_req:-0}" -gt 0 ] 2>/dev/null; then
+                BP_HIT=$(awk -v r="${bp_reads:-0}" -v req="$bp_req" \
+                    'BEGIN{printf "%.1f%%", (1-(r/req))*100}')
+            fi
+
+            # ── Colour thresholds ──────────────────
+            conn_pct=0
+            [ "${max_conn:-0}" -gt 0 ] && conn_pct=$(( ${threads_conn:-0} * 100 / max_conn ))
+            conn_col="${GREEN_S}";   [ "$conn_pct" -ge 70 ] && conn_col="${ORANGE}";  [ "$conn_pct" -ge 90 ] && conn_col="${RED}${BOLD}"
+            run_col="${GREEN_S}";    [ "${threads_run:-0}" -ge 10 ] && run_col="${ORANGE}"; [ "${threads_run:-0}" -ge 30 ] && run_col="${RED}${BOLD}"
+            slow_col="${GREEN_S}";   [ "${slow_q:-0}" -ge 5  ] && slow_col="${ORANGE}"; [ "${slow_q:-0}" -ge 20 ] && slow_col="${RED}${BOLD}"
+            lock_col="${GREEN_S}";   [ "${lock_wait:-0}" -ge 1  ] && lock_col="${ORANGE}"; [ "${lock_wait:-0}" -ge 10 ] && lock_col="${RED}${BOLD}"
+            bp_num=$(echo "$BP_HIT" | tr -d '%')
+            bp_col="${GREEN_S}";     [ "${bp_num:-100}" != "n/a" ] && [ "${bp_num%.*}" -lt 99 ] 2>/dev/null && bp_col="${ORANGE}"
+                                     [ "${bp_num:-100}" != "n/a" ] && [ "${bp_num%.*}" -lt 95 ] 2>/dev/null && bp_col="${RED}${BOLD}"
+            qps_col="${GREEN_S}";    [ "${QPS:-0}" -ge 500  ] && qps_col="${ORANGE}"; [ "${QPS:-0}" -ge 2000 ] && qps_col="${RED}${BOLD}"
+
+            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${conn_col}%s / %s${R} ${DGRAY}(%s%%)${R}\n" \
+                "Connections" "${threads_conn:-?}" "${max_conn:-?}" "$conn_pct"
+            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${run_col}%s${R}\n" \
+                "Threads running"  "${threads_run:-?}"
+            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${qps_col}%s q/s${R}\n" \
+                "QPS (last 20s)"   "${QPS}"
+            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${slow_col}%s${R}\n" \
+                "Slow queries"     "${slow_q:-?}"
+            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${lock_col}%s${R}\n" \
+                "Table lock waits" "${lock_wait:-?}"
+            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${bp_col}%s${R}\n" \
+                "InnoDB hit rate"  "${BP_HIT}"
+            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${ORANGE}%s${R}\n" \
+                "Row lock waits"   "${row_locks:-?}"
+            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${GRAY}%s${R}\n" \
+                "Aborted connects" "${aborted:-?}"
         fi
     } > "$C2"
 
@@ -770,7 +891,247 @@ while true; do
     }
     hline '─' "$DGRAY"
 
-        # ════════════════════════════════════════════
+    # ════════════════════════════════════════════
+    #  BLOCK 6: MYSQL ACTIVE PROCESSES — FULL WIDTH
+    #
+    #  MySQL gets its own full-width block because
+    #  query text is too long for a half-column.
+    #  Each process shows a summary line then the
+    #  full query wrapped to terminal width.
+    # ════════════════════════════════════════════
+    {
+        printf "${MAGENTA}${BOLD}  ▶  MYSQL ACTIVE PROCESSES${R}\n"
+        printf "  ${DGRAY}%-${COL_MYSQL_ID}s %-${COL_MYSQL_DB}s %-${COL_MYSQL_TIME}s %-${COL_MYSQL_STATE}s %s${R}\n" \
+            "ID" "DATABASE" "TIME" "STATE" "QUERY PREVIEW"
+        printf "  ${DGRAY}%-${COL_MYSQL_ID}s %-${COL_MYSQL_DB}s %-${COL_MYSQL_TIME}s %-${COL_MYSQL_STATE}s %s${R}\n" \
+            "────────" "──────────────────────" "──────" "────────────────" "$(printf '─%.0s' $(seq 1 $COL_MYSQL_QUERY))"
+
+        mysql_out=$(mysql --batch --silent -e "
+            SELECT
+                ID,
+                IFNULL(DB, 'system')    AS DB,
+                TIME,
+                IFNULL(STATE, '')       AS STATE,
+                IFNULL(INFO, '')        AS INFO
+            FROM information_schema.PROCESSLIST
+            WHERE COMMAND != 'Sleep'
+              AND INFO IS NOT NULL
+            ORDER BY TIME DESC
+            LIMIT 8;" 2>/dev/null)
+
+        if [ -z "$mysql_out" ]; then
+            printf "  ${GRAY}${DIM}(no active queries)${R}\n"
+        else
+            # Use process substitution so IFS=$'\t' applies cleanly per-line
+            while IFS=$'\t' read -r id db time state query; do
+                [[ "$id" == "ID" ]] && continue
+                [ -z "$id" ]        && continue
+
+                # Time colouring: red ≥ 5s, orange otherwise
+                if [ "${time:-0}" -ge 5 ] 2>/dev/null; then
+                    tc="\033[38;5;196m"   # red
+                else
+                    tc="\033[38;5;214m"   # orange
+                fi
+
+                # ── Summary line: ID  DB  TIME  STATE ──────────────
+                printf "  \033[38;5;244m%-${COL_MYSQL_ID}s\033[0m" "$id"
+                printf " \033[38;5;82m%-${COL_MYSQL_DB}.${COL_MYSQL_DB}s\033[0m" "$db"
+                printf " ${tc}%-${COL_MYSQL_TIME}s\033[0m" "${time}s"
+                printf " \033[38;5;45m%-${COL_MYSQL_STATE}.${COL_MYSQL_STATE}s\033[0m\n" "$state"
+
+                # ── Full query, word-wrapped at COL_MYSQL_QUERY ──────
+                # Normalize whitespace: collapse newlines/tabs to single space
+                clean_query=$(echo "$query" | tr '\n\t' '  ' | tr -s ' ')
+                echo "$clean_query" | fold -s -w "$COL_MYSQL_QUERY" | \
+                while IFS= read -r qline; do
+                    printf "  \033[38;5;240m│\033[0m \033[38;5;255m%s\033[0m\n" "$qline"
+                done
+
+                # ── Per-process separator ────────────────────────────
+                printf "  \033[38;5;237m%s\033[0m\n" \
+                    "$(printf '╌%.0s' $(seq 1 $(( TW - 4 ))))"
+            done <<< "$mysql_out"
+        fi
+    }
+    hline '─' "$DGRAY"
+
+    # ════════════════════════════════════════════
+    #  BLOCK 7: FILE CHANGES (left) | PHP SLOWLOG (right)
+    #  File cache is scanned every SCAN_INTERVAL
+    # ════════════════════════════════════════════
+    C1=$(mktemp); C2=$(mktemp)
+
+    {
+        CUR_TIME=$(date +%s)
+        LAST_FILE_SCAN=$(cat "$FILE_SCAN_TS" 2>/dev/null | tr -d '[:space:]')
+        LAST_FILE_SCAN=$(( ${LAST_FILE_SCAN:-0} + 0 ))
+
+        if (( CUR_TIME - LAST_FILE_SCAN > SCAN_INTERVAL )); then
+
+            # Pass 1 — collect every changed file into a flat tsv:
+            #   domain <TAB> type <TAB> plugin <TAB> mod_datetime
+            find /home/nginx/domains/*/public/wp-content/{plugins,themes} \
+                -maxdepth 3 -mmin -1440 -type f \
+                \( -name "*.php" -o -name "*.js" \) 2>/dev/null \
+            | while IFS= read -r filepath; do
+                dom=$(echo   "$filepath" | cut -d'/' -f5)
+                ftype=$(echo "$filepath" | cut -d'/' -f8)
+                plugin=$(echo "$filepath" | cut -d'/' -f9)
+                mod=$(stat -c "%y" "$filepath" 2>/dev/null | cut -d'.' -f1)
+                printf "%s\t%s\t%s\t%s\n" "$dom" "$ftype" "$plugin" "$mod"
+            done \
+            | awk -F'\t' '
+            {
+                key = $1 "\t" $2 "\t" $3    # domain + type + plugin name
+                count[key]++
+                # keep the latest mod time per plugin
+                if ($4 > latest[key]) latest[key] = $4
+            }
+            END {
+                for (k in count) {
+                    split(k, p, "\t")
+                    # p[1]=domain  p[2]=type  p[3]=plugin
+                    printf "%s\t%s\t%s\t%d\t%s\n", p[1], p[2], p[3], count[k], latest[k]
+                }
+            }' \
+            | sort -t$'\t' -k5,5r \
+            | head -12 > "$FILE_CACHE"
+
+            echo "$CUR_TIME" > "$FILE_SCAN_TS"
+        fi
+
+        printf "${ORANGE}${BOLD}  ▶  FILE CHANGES (Last 24h — Scanned every 15m)${R}\n"
+        printf "  ${DGRAY}%-${COL_FC_DOM}s %-${COL_FC_TYPE}s %-${COL_FC_COUNT}s %-${COL_FC_PLUGIN}s %s${R}\n" \
+            "DOMAIN" "TYPE" "FILES" "PLUGIN / THEME" "LAST MODIFIED"
+        printf "  ${DGRAY}%-${COL_FC_DOM}s %-${COL_FC_TYPE}s %-${COL_FC_COUNT}s %-${COL_FC_PLUGIN}s %s${R}\n" \
+            "$(printf '─%.0s' $(seq 1 $COL_FC_DOM))" \
+            "$(printf '─%.0s' $(seq 1 $COL_FC_TYPE))" \
+            "$(printf '─%.0s' $(seq 1 $COL_FC_COUNT))" \
+            "$(printf '─%.0s' $(seq 1 $COL_FC_PLUGIN))" \
+            "───────────────────"
+
+        if [ -s "$FILE_CACHE" ]; then
+            while IFS=$'\t' read -r dom ftype plugin count modtime; do
+                if [ "$ftype" = "plugins" ]; then
+                    t_col="\033[38;5;45m";  t_label="Plugin"
+                else
+                    t_col="\033[38;5;171m"; t_label="Theme"
+                fi
+
+                # Colour the file count: orange if > 5 files changed, green otherwise
+                if [ "${count:-0}" -gt 5 ] 2>/dev/null; then
+                    c_col="\033[38;5;214m"
+                else
+                    c_col="\033[38;5;82m"
+                fi
+
+                printf "  \033[38;5;114m%-${COL_FC_DOM}.${COL_FC_DOM}s\033[0m ${t_col}%-${COL_FC_TYPE}s\033[0m ${c_col}%-${COL_FC_COUNT}s\033[0m \033[38;5;220m%-${COL_FC_PLUGIN}.${COL_FC_PLUGIN}s\033[0m \033[38;5;244m%s\033[0m\n" \
+                    "$dom" "$t_label" "$count" "$plugin" "$modtime"
+            done < "$FILE_CACHE"
+        else
+            printf "  ${GRAY}${DIM}(no changes detected in the last 24h)${R}\n"
+        fi
+    } > "$C1"
+
+    # RIGHT — PHP Slowlog (paired with file changes — both are "what changed" views)
+    {
+        if [ -f "$SLOWLOG" ]; then
+            printf "${RED_S}${BOLD}  ▶  PHP SLOWLOG — TOP CULPRITS${R}\n"
+            printf "  ${DGRAY}%-${COL_SLOW_COUNT}s %-${COL_SLOW_DOM}s %s${R}\n" "COUNT" "DOMAIN" "PLUGIN"
+            printf "  ${DGRAY}%-${COL_SLOW_COUNT}s %-${COL_SLOW_DOM}s %s${R}\n" "──────" "────────────────────────" "──────────────────────"
+            grep "wp-content/plugins/" "$SLOWLOG" | \
+            sed -rn 's/.*\/domains\/([^/]+)\/.*plugins\/([^/ ]+).*/\1 \2/p' | \
+            sort | uniq -c | sort -nr | head -8 | \
+            awk -v o="${ORANGE}" -v g="${GREEN_S}" -v rs="${RED_S}" -v r="${R}" \
+                -v sc="$COL_SLOW_COUNT" -v sd="$COL_SLOW_DOM" -v sp="$COL_SLOW_PLUGIN" \
+                '{printf "  %s%-"sc"s%s  %s%-"sd"."sd"s%s  %s%-"sp"."sp"s%s\n", o,$1,r, g,$2,r, rs,$3,r}'
+        else
+            printf "${GRAY}${DIM}  ▶  PHP SLOWLOG${R}\n"
+            printf "  ${GRAY}${DIM}(slowlog not found at configured path)${R}\n"
+        fi
+    } > "$C2"
+
+    render_two_cols "$C1" "$C2"
+    rm -f "$C1" "$C2"
+    hline '─' "$DGRAY"
+
+    # ════════════════════════════════════════════
+    #  BLOCK 8: DISK I/O — FULL WIDTH
+    #
+    #  Uses /proc/diskstats with a 1s delta to
+    #  compute real KB/s read+write and await ms.
+    #  Only shows physical disks (sd*, nvme*, vd*).
+    #  Falls back to iostat if available.
+    # ════════════════════════════════════════════
+    {
+        printf "${YELLOW}${BOLD}  ▶  DISK I/O${R}\n"
+        printf "  ${DGRAY}%-${COL_IO_DEV}s %-${COL_IO_READ}s %-${COL_IO_WRITE}s %-${COL_IO_AWAIT}s %-${COL_IO_UTIL}s %s${R}\n" \
+            "DEVICE" "READ/s" "WRITE/s" "AWAIT(ms)" "UTIL%" "STATUS"
+        printf "  ${DGRAY}%-${COL_IO_DEV}s %-${COL_IO_READ}s %-${COL_IO_WRITE}s %-${COL_IO_AWAIT}s %-${COL_IO_UTIL}s %s${R}\n" \
+            "──────────" "──────────" "──────────" "────────────" "────────" "──────────"
+
+        if command -v iostat &>/dev/null; then
+            # iostat -x: extended stats, 2 samples 1s apart, show only the second
+            iostat -xk 1 2 2>/dev/null | awk '
+            /^(sd|nvme|vd|xvd|hd)[a-z0-9]/ {
+                dev=$1; rkbs=$6; wkbs=$7; await=$10; util=$NF
+                # colour thresholds
+                uc="\033[38;5;82m"
+                if (util+0 >= 50) uc="\033[38;5;214m"
+                if (util+0 >= 85) uc="\033[38;5;196m\033[1m"
+                ac="\033[38;5;82m"
+                if (await+0 >= 20) ac="\033[38;5;214m"
+                if (await+0 >= 100) ac="\033[38;5;196m\033[1m"
+
+                st="✔ OK"
+                stc="\033[38;5;82m"
+                if (util+0 >= 85 || await+0 >= 100) { st="⚠ HIGH"; stc="\033[38;5;196m\033[1m" }
+                else if (util+0 >= 50 || await+0 >= 20) { st="▲ BUSY"; stc="\033[38;5;214m" }
+
+                printf "  \033[38;5;255m%-10s\033[0m %s%-9s\033[0m %s%-9s\033[0m %s%-10s\033[0m %s%-8s\033[0m %b%s\033[0m\n",
+                    dev,
+                    "\033[38;5;45m",  sprintf("%.0fK", rkbs),
+                    "\033[38;5;171m", sprintf("%.0fK", wkbs),
+                    ac, sprintf("%.1fms", await),
+                    uc, sprintf("%.0f%%", util),
+                    stc, st
+            }' | tail -n +2   # skip first sample (cumulative), keep second (interval)
+        else
+            # Fallback: /proc/diskstats two-snapshot delta
+            snap1=$(awk '/^[ ]*[0-9]+ [0-9]+ (sd|nvme|vd)/ {print $3,$6,$10,$13}' /proc/diskstats 2>/dev/null)
+            sleep 1
+            snap2=$(awk '/^[ ]*[0-9]+ [0-9]+ (sd|nvme|vd)/ {print $3,$6,$10,$13}' /proc/diskstats 2>/dev/null)
+
+            paste <(echo "$snap1") <(echo "$snap2") | awk '{
+                dev=$1
+                dr=($6-$2)*512/1024    # sectors→KB
+                dw=($7-$3)*512/1024
+                dio_ms=($8-$4)         # ms spent in I/O
+                # simple util: ms doing I/O in last 1000ms
+                util=(dio_ms > 1000) ? 100 : dio_ms/10
+
+                uc="\033[38;5;82m"
+                if (util >= 50) uc="\033[38;5;214m"
+                if (util >= 85) uc="\033[38;5;196m\033[1m"
+
+                st="✔ OK"; stc="\033[38;5;82m"
+                if (util >= 85) { st="⚠ HIGH"; stc="\033[38;5;196m\033[1m" }
+                else if (util >= 50) { st="▲ BUSY"; stc="\033[38;5;214m" }
+
+                printf "  \033[38;5;255m%-10s\033[0m \033[38;5;45m%-10s\033[0m \033[38;5;171m%-10s\033[0m \033[38;5;244m%-12s\033[0m %s%-8s\033[0m %b%s\033[0m\n",
+                    dev,
+                    sprintf("%.0fK/s", dr),
+                    sprintf("%.0fK/s", dw),
+                    "n/a",
+                    uc, sprintf("%.0f%%", util),
+                    stc, st
+            }'
+        fi
+    }
+    hline '─' "$DGRAY"
+
+    # ════════════════════════════════════════════
     #  BLOCK 9: NGINX ERROR LOG MONITOR — FULL WIDTH
     #
     #  Reads the last 200 lines of each domain's
@@ -910,370 +1271,6 @@ while true; do
         fi
     }
     hline '─' "$DGRAY"
-
-    # ════════════════════════════════════════════
-    #  BLOCK 6: MYSQL ACTIVE PROCESSES — FULL WIDTH
-    #
-    #  MySQL gets its own full-width block because
-    #  query text is too long for a half-column.
-    #  Each process shows a summary line then the
-    #  full query wrapped to terminal width.
-    # ════════════════════════════════════════════
-    {
-        printf "${MAGENTA}${BOLD}  ▶  MYSQL ACTIVE PROCESSES${R}\n"
-        printf "  ${DGRAY}%-${COL_MYSQL_ID}s %-${COL_MYSQL_DB}s %-${COL_MYSQL_TIME}s %-${COL_MYSQL_STATE}s %s${R}\n" \
-            "ID" "DATABASE" "TIME" "STATE" "QUERY PREVIEW"
-        printf "  ${DGRAY}%-${COL_MYSQL_ID}s %-${COL_MYSQL_DB}s %-${COL_MYSQL_TIME}s %-${COL_MYSQL_STATE}s %s${R}\n" \
-            "────────" "──────────────────────" "──────" "────────────────" "$(printf '─%.0s' $(seq 1 $COL_MYSQL_QUERY))"
-
-        mysql_out=$(mysql --batch --silent -e "
-            SELECT
-                ID,
-                IFNULL(DB, 'system')    AS DB,
-                TIME,
-                IFNULL(STATE, '')       AS STATE,
-                IFNULL(INFO, '')        AS INFO
-            FROM information_schema.PROCESSLIST
-            WHERE COMMAND != 'Sleep'
-              AND INFO IS NOT NULL
-            ORDER BY TIME DESC
-            LIMIT 8;" 2>/dev/null)
-
-        if [ -z "$mysql_out" ]; then
-            printf "  ${GRAY}${DIM}(no active queries)${R}\n"
-        else
-            # Use process substitution so IFS=$'\t' applies cleanly per-line
-            while IFS=$'\t' read -r id db time state query; do
-                [[ "$id" == "ID" ]] && continue
-                [ -z "$id" ]        && continue
-
-                # Time colouring: red ≥ 5s, orange otherwise
-                if [ "${time:-0}" -ge 5 ] 2>/dev/null; then
-                    tc="\033[38;5;196m"   # red
-                else
-                    tc="\033[38;5;214m"   # orange
-                fi
-
-                # ── Summary line: ID  DB  TIME  STATE ──────────────
-                printf "  \033[38;5;244m%-${COL_MYSQL_ID}s\033[0m" "$id"
-                printf " \033[38;5;82m%-${COL_MYSQL_DB}.${COL_MYSQL_DB}s\033[0m" "$db"
-                printf " ${tc}%-${COL_MYSQL_TIME}s\033[0m" "${time}s"
-                printf " \033[38;5;45m%-${COL_MYSQL_STATE}.${COL_MYSQL_STATE}s\033[0m\n" "$state"
-
-                # ── Full query, word-wrapped at COL_MYSQL_QUERY ──────
-                # Normalize whitespace: collapse newlines/tabs to single space
-                clean_query=$(echo "$query" | tr '\n\t' '  ' | tr -s ' ')
-                echo "$clean_query" | fold -s -w "$COL_MYSQL_QUERY" | \
-                while IFS= read -r qline; do
-                    printf "  \033[38;5;240m│\033[0m \033[38;5;255m%s\033[0m\n" "$qline"
-                done
-
-                # ── Per-process separator ────────────────────────────
-                printf "  \033[38;5;237m%s\033[0m\n" \
-                    "$(printf '╌%.0s' $(seq 1 $(( TW - 4 ))))"
-            done <<< "$mysql_out"
-        fi
-    }
-    hline '─' "$DGRAY"
-
-    # ════════════════════════════════════════════
-    #  BLOCK 7: Network Connections (left) | PHP SLOWLOG (right)
-    #  File cache is scanned every SCAN_INTERVAL
-    # ════════════════════════════════════════════
-    C1=$(mktemp); C2=$(mktemp)
-
-     # LEFT — Network Connections
-    {
-        printf "${CYAN}${BOLD}  ▶  NETWORK CONNECTIONS${R}\n"
-        printf "  ${DGRAY}%-${COL_NET_STATE}s %s${R}\n" "STATE" "COUNT"
-        printf "  ${DGRAY}%-${COL_NET_STATE}s %s${R}\n" "───────────────────────" "─────"
-        netstat -ant 2>/dev/null | awk '{print $6}' \
-            | grep -v 'State\|Foreign\|^$' \
-            | sort | uniq -c | sort -nr | head -8 | \
-        while read -r cnt state; do
-            [ -z "$state" ] && continue
-            case "$state" in
-                ESTABLISHED) sc="${GREEN}" ;;
-                SYN_RECV)    sc="${RED}${BOLD}" ;;
-                TIME_WAIT)   sc="${ORANGE}" ;;
-                CLOSE_WAIT)  sc="${YELLOW}" ;;
-                LISTEN)      sc="${CYAN_S}" ;;
-                FIN_WAIT*)   sc="${MAGENTA}" ;;
-                *)           sc="${GRAY}" ;;
-            esac
-            printf "  ${sc}%-${COL_NET_STATE}s${R}  ${WHITE}%s${R}\n" "$state" "$cnt"
-        done
-        syn_count=$(netstat -ant 2>/dev/null | grep -c "SYN_RECV" | head -n1)
-        : "${syn_count:=0}"
-        if [ "$syn_count" -gt 20 ]; then
-            printf "\n  ${RED}${BOLD}${BLINK}⚠ SYN FLOOD: %s conns!${R}\n" "$syn_count"
-        fi
-    } > "$C1"
-
-    # RIGHT — PHP Slowlog (paired with file changes — both are "what changed" views)
-    {
-        if [ -f "$SLOWLOG" ]; then
-            printf "${RED_S}${BOLD}  ▶  PHP SLOWLOG — TOP CULPRITS${R}\n"
-            printf "  ${DGRAY}%-${COL_SLOW_COUNT}s %-${COL_SLOW_DOM}s %s${R}\n" "COUNT" "DOMAIN" "PLUGIN"
-            printf "  ${DGRAY}%-${COL_SLOW_COUNT}s %-${COL_SLOW_DOM}s %s${R}\n" "──────" "────────────────────────" "──────────────────────"
-            grep "wp-content/plugins/" "$SLOWLOG" | \
-            sed -rn 's/.*\/domains\/([^/]+)\/.*plugins\/([^/ ]+).*/\1 \2/p' | \
-            sort | uniq -c | sort -nr | head -8 | \
-            awk -v o="${ORANGE}" -v g="${GREEN_S}" -v rs="${RED_S}" -v r="${R}" \
-                -v sc="$COL_SLOW_COUNT" -v sd="$COL_SLOW_DOM" -v sp="$COL_SLOW_PLUGIN" \
-                '{printf "  %s%-"sc"s%s  %s%-"sd"."sd"s%s  %s%-"sp"."sp"s%s\n", o,$1,r, g,$2,r, rs,$3,r}'
-        else
-            printf "${GRAY}${DIM}  ▶  PHP SLOWLOG${R}\n"
-            printf "  ${GRAY}${DIM}(slowlog not found at configured path)${R}\n"
-        fi
-    } > "$C2"
-
-    render_two_cols "$C1" "$C2"
-    rm -f "$C1" "$C2"
-    hline '─' "$DGRAY"
-
-    # ════════════════════════════════════════════
-    #  BLOCK 8: DISK I/O — FULL WIDTH
-    #
-    #  Uses /proc/diskstats with a 1s delta to
-    #  compute real KB/s read+write and await ms.
-    #  Only shows physical disks (sd*, nvme*, vd*).
-    #  Falls back to iostat if available.
-    # ════════════════════════════════════════════
-    {
-        printf "${YELLOW}${BOLD}  ▶  DISK I/O${R}\n"
-        printf "  ${DGRAY}%-${COL_IO_DEV}s %-${COL_IO_READ}s %-${COL_IO_WRITE}s %-${COL_IO_AWAIT}s %-${COL_IO_UTIL}s %s${R}\n" \
-            "DEVICE" "READ/s" "WRITE/s" "AWAIT(ms)" "UTIL%" "STATUS"
-        printf "  ${DGRAY}%-${COL_IO_DEV}s %-${COL_IO_READ}s %-${COL_IO_WRITE}s %-${COL_IO_AWAIT}s %-${COL_IO_UTIL}s %s${R}\n" \
-            "──────────" "──────────" "──────────" "────────────" "────────" "──────────"
-
-        if command -v iostat &>/dev/null; then
-            # iostat -x: extended stats, 2 samples 1s apart, show only the second
-            iostat -xk 1 2 2>/dev/null | awk '
-            /^(sd|nvme|vd|xvd|hd)[a-z0-9]/ {
-                dev=$1; rkbs=$6; wkbs=$7; await=$10; util=$NF
-                # colour thresholds
-                uc="\033[38;5;82m"
-                if (util+0 >= 50) uc="\033[38;5;214m"
-                if (util+0 >= 85) uc="\033[38;5;196m\033[1m"
-                ac="\033[38;5;82m"
-                if (await+0 >= 20) ac="\033[38;5;214m"
-                if (await+0 >= 100) ac="\033[38;5;196m\033[1m"
-
-                st="✔ OK"
-                stc="\033[38;5;82m"
-                if (util+0 >= 85 || await+0 >= 100) { st="⚠ HIGH"; stc="\033[38;5;196m\033[1m" }
-                else if (util+0 >= 50 || await+0 >= 20) { st="▲ BUSY"; stc="\033[38;5;214m" }
-
-                printf "  \033[38;5;255m%-10s\033[0m %s%-9s\033[0m %s%-9s\033[0m %s%-10s\033[0m %s%-8s\033[0m %b%s\033[0m\n",
-                    dev,
-                    "\033[38;5;45m",  sprintf("%.0fK", rkbs),
-                    "\033[38;5;171m", sprintf("%.0fK", wkbs),
-                    ac, sprintf("%.1fms", await),
-                    uc, sprintf("%.0f%%", util),
-                    stc, st
-            }' | tail -n +2   # skip first sample (cumulative), keep second (interval)
-        else
-            # Fallback: /proc/diskstats two-snapshot delta
-            snap1=$(awk '/^[ ]*[0-9]+ [0-9]+ (sd|nvme|vd)/ {print $3,$6,$10,$13}' /proc/diskstats 2>/dev/null)
-            sleep 1
-            snap2=$(awk '/^[ ]*[0-9]+ [0-9]+ (sd|nvme|vd)/ {print $3,$6,$10,$13}' /proc/diskstats 2>/dev/null)
-
-            paste <(echo "$snap1") <(echo "$snap2") | awk '{
-                dev=$1
-                dr=($6-$2)*512/1024    # sectors→KB
-                dw=($7-$3)*512/1024
-                dio_ms=($8-$4)         # ms spent in I/O
-                # simple util: ms doing I/O in last 1000ms
-                util=(dio_ms > 1000) ? 100 : dio_ms/10
-
-                uc="\033[38;5;82m"
-                if (util >= 50) uc="\033[38;5;214m"
-                if (util >= 85) uc="\033[38;5;196m\033[1m"
-
-                st="✔ OK"; stc="\033[38;5;82m"
-                if (util >= 85) { st="⚠ HIGH"; stc="\033[38;5;196m\033[1m" }
-                else if (util >= 50) { st="▲ BUSY"; stc="\033[38;5;214m" }
-
-                printf "  \033[38;5;255m%-10s\033[0m \033[38;5;45m%-10s\033[0m \033[38;5;171m%-10s\033[0m \033[38;5;244m%-12s\033[0m %s%-8s\033[0m %b%s\033[0m\n",
-                    dev,
-                    sprintf("%.0fK/s", dr),
-                    sprintf("%.0fK/s", dw),
-                    "n/a",
-                    uc, sprintf("%.0f%%", util),
-                    stc, st
-            }'
-        fi
-    }
-    hline '─' "$DGRAY"
-
-        # ════════════════════════════════════════════
-    #  BLOCK 4: PHP-FPM Pools (left) | MySQL Health (right)
-    # ════════════════════════════════════════════
-    C1=$(mktemp); C2=$(mktemp)
-
-    # LEFT — PHP-FPM pool status
-    # Reads /proc/net/unix to find fpm socket paths, then
-    # queries each pool's status page via cgi-fcgi.
-    # Falls back to ps worker count if unreachable.
-    {
-        printf "${CYAN}${BOLD}  ▶  PHP-FPM POOLS${R}\n"
-        printf "  ${DGRAY}%-${COL_FPM_POOL}s %-${COL_FPM_ACT}s %-${COL_FPM_IDLE}s %-${COL_FPM_MAX}s %-${COL_FPM_QUEUE}s %s${R}\n" \
-            "POOL" "ACTIVE" "IDLE" "MAX" "QUEUE" "STATUS"
-        printf "  ${DGRAY}%-${COL_FPM_POOL}s %-${COL_FPM_ACT}s %-${COL_FPM_IDLE}s %-${COL_FPM_MAX}s %-${COL_FPM_QUEUE}s %s${R}\n" \
-            "$(printf '─%.0s' $(seq 1 $COL_FPM_POOL))" "──────" "─────" "─────" "──────" "──────────"
-
-        fpm_found=0
-
-        # Method 1: query status pages via unix sockets using cgi-fcgi
-        if command -v cgi-fcgi &>/dev/null; then
-            for sock in /var/run/php*.sock /run/php/*.sock /tmp/php*.sock; do
-                [ -S "$sock" ] || continue
-                pool=$(basename "$sock" .sock | sed 's/php[0-9.-]*-fpm-\?//')
-                [ -z "$pool" ] && pool=$(basename "$sock" .sock)
-
-                status_raw=$(SCRIPT_FILENAME=/status SCRIPT_NAME=/status \
-                    REQUEST_METHOD=GET cgi-fcgi -bind -connect "$sock" 2>/dev/null)
-
-                active=$(echo "$status_raw" | grep "^active processes:"  | awk '{print $NF}')
-                idle=$(echo   "$status_raw" | grep "^idle processes:"    | awk '{print $NF}')
-                maxc=$(echo   "$status_raw" | grep "^max children reached" | awk '{print $NF}')
-                queue=$(echo  "$status_raw" | grep "^listen queue:"      | awk '{print $NF}')
-                maxq=$(echo   "$status_raw" | grep "^max listen queue:"  | awk '{print $NF}')
-
-                [ -z "$active" ] && continue
-                fpm_found=1
-
-                total=$(( ${active:-0} + ${idle:-0} ))
-                [ "$total" -eq 0 ] && total=1
-                pct=$(( ${active:-0} * 100 / total ))
-
-                if   [ "${active:-0}" -ge "${maxc:-999}" ] 2>/dev/null; then
-                    st="${RED}${BOLD}⚠ SATURATED${R}"
-                elif [ "$pct" -ge 80 ]; then
-                    st="${ORANGE}▲ HIGH${R}"
-                else
-                    st="${GREEN_S}✔ OK${R}"
-                fi
-
-                printf "  ${WHITE}%-${COL_FPM_POOL}.${COL_FPM_POOL}s${R} " "$pool"
-                printf "${ORANGE}%-${COL_FPM_ACT}s${R} "    "${active:-0}"
-                printf "${GRAY}%-${COL_FPM_IDLE}s${R} "     "${idle:-0}"
-                printf "${DGRAY}%-${COL_FPM_MAX}s${R} "     "${maxc:-?}"
-                printf "${YELLOW}%-${COL_FPM_QUEUE}s${R} "  "${queue:-0}"
-                printf "%b\n" "$st"
-            done
-        fi
-
-        # Method 2: fallback — count php-fpm worker processes via ps
-        if [ "$fpm_found" -eq 0 ]; then
-            ps -eo comm,stat 2>/dev/null | awk '
-            /php-fpm/ || /php[0-9].*-fpm/ {
-                if ($2 ~ /^S/) idle++
-                else if ($2 ~ /^R/) active++
-                total++
-            }
-            END {
-                if (total > 0) {
-                    pct = int(active*100/total)
-                    st = (pct >= 80) ? "\033[38;5;196mHIGH\033[0m" : "\033[38;5;82m✔ OK\033[0m"
-                    printf "  \033[38;5;255m%-20s\033[0m %-7s %-6s %-6s %-7s %b\n",
-                        "php-fpm", active+0, idle+0, total, "n/a", st
-                } else {
-                    print "  \033[38;5;244m(php-fpm not detected or status page unreachable)\033[0m"
-                }
-            }'
-        fi
-    } > "$C1"
-
-    # RIGHT — MySQL Health metrics
-    # Uses mysqladmin status + SHOW GLOBAL STATUS for key counters.
-    # QPS is computed as a delta against the previous refresh so it
-    # shows actual queries/sec rather than a lifetime cumulative.
-    {
-        printf "${MAGENTA}${BOLD}  ▶  MYSQL HEALTH${R}\n"
-        printf "  ${DGRAY}%-${COL_MH_LABEL}s %s${R}\n" "METRIC" "VALUE"
-        printf "  ${DGRAY}%-${COL_MH_LABEL}s %s${R}\n" "$(printf '─%.0s' $(seq 1 $COL_MH_LABEL))" "──────────────"
-
-        # Fetch all status vars in one query
-        mysql_health=$(mysql --batch --silent -e "
-            SHOW GLOBAL STATUS WHERE Variable_name IN (
-                'Threads_connected','Threads_running','max_used_connections',
-                'Questions','Slow_queries','Table_locks_waited',
-                'Innodb_buffer_pool_reads','Innodb_buffer_pool_read_requests',
-                'Innodb_row_lock_waits','Com_select','Com_insert',
-                'Com_update','Com_delete','Aborted_connects'
-            );
-            SHOW VARIABLES WHERE Variable_name = 'max_connections';" 2>/dev/null)
-
-        if [ -z "$mysql_health" ]; then
-            printf "  ${GRAY}${DIM}(mysql not accessible)${R}\n"
-        else
-            get_val() { echo "$mysql_health" | awk -v k="$1" '$1==k{print $2}'; }
-
-            threads_conn=$(get_val "Threads_connected")
-            threads_run=$(get_val  "Threads_running")
-            max_conn=$(get_val     "max_connections")
-            questions=$(get_val    "Questions")
-            slow_q=$(get_val       "Slow_queries")
-            lock_wait=$(get_val    "Table_locks_waited")
-            bp_reads=$(get_val     "Innodb_buffer_pool_reads")
-            bp_req=$(get_val       "Innodb_buffer_pool_read_requests")
-            row_locks=$(get_val    "Innodb_row_lock_waits")
-            aborted=$(get_val      "Aborted_connects")
-
-            # ── QPS delta ─────────────────────────
-            prev_q=$(cat "$MYSQL_QPS_STATE" 2>/dev/null || echo 0)
-            QPS=0
-            if [ -n "$questions" ] && [ "${prev_q:-0}" -gt 0 ] 2>/dev/null; then
-                QPS=$(( (questions - prev_q) / 20 ))   # 20s refresh interval
-                [ "$QPS" -lt 0 ] && QPS=0
-            fi
-            echo "${questions:-0}" > "$MYSQL_QPS_STATE"
-
-            # ── InnoDB buffer pool hit rate ────────
-            BP_HIT="n/a"
-            if [ -n "$bp_req" ] && [ "${bp_req:-0}" -gt 0 ] 2>/dev/null; then
-                BP_HIT=$(awk -v r="${bp_reads:-0}" -v req="$bp_req" \
-                    'BEGIN{printf "%.1f%%", (1-(r/req))*100}')
-            fi
-
-            # ── Colour thresholds ──────────────────
-            conn_pct=0
-            [ "${max_conn:-0}" -gt 0 ] && conn_pct=$(( ${threads_conn:-0} * 100 / max_conn ))
-            conn_col="${GREEN_S}";   [ "$conn_pct" -ge 70 ] && conn_col="${ORANGE}";  [ "$conn_pct" -ge 90 ] && conn_col="${RED}${BOLD}"
-            run_col="${GREEN_S}";    [ "${threads_run:-0}" -ge 10 ] && run_col="${ORANGE}"; [ "${threads_run:-0}" -ge 30 ] && run_col="${RED}${BOLD}"
-            slow_col="${GREEN_S}";   [ "${slow_q:-0}" -ge 5  ] && slow_col="${ORANGE}"; [ "${slow_q:-0}" -ge 20 ] && slow_col="${RED}${BOLD}"
-            lock_col="${GREEN_S}";   [ "${lock_wait:-0}" -ge 1  ] && lock_col="${ORANGE}"; [ "${lock_wait:-0}" -ge 10 ] && lock_col="${RED}${BOLD}"
-            bp_num=$(echo "$BP_HIT" | tr -d '%')
-            bp_col="${GREEN_S}";     [ "${bp_num:-100}" != "n/a" ] && [ "${bp_num%.*}" -lt 99 ] 2>/dev/null && bp_col="${ORANGE}"
-                                     [ "${bp_num:-100}" != "n/a" ] && [ "${bp_num%.*}" -lt 95 ] 2>/dev/null && bp_col="${RED}${BOLD}"
-            qps_col="${GREEN_S}";    [ "${QPS:-0}" -ge 500  ] && qps_col="${ORANGE}"; [ "${QPS:-0}" -ge 2000 ] && qps_col="${RED}${BOLD}"
-
-            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${conn_col}%s / %s${R} ${DGRAY}(%s%%)${R}\n" \
-                "Connections" "${threads_conn:-?}" "${max_conn:-?}" "$conn_pct"
-            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${run_col}%s${R}\n" \
-                "Threads running"  "${threads_run:-?}"
-            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${qps_col}%s q/s${R}\n" \
-                "QPS (last 20s)"   "${QPS}"
-            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${slow_col}%s${R}\n" \
-                "Slow queries"     "${slow_q:-?}"
-            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${lock_col}%s${R}\n" \
-                "Table lock waits" "${lock_wait:-?}"
-            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${bp_col}%s${R}\n" \
-                "InnoDB hit rate"  "${BP_HIT}"
-            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${ORANGE}%s${R}\n" \
-                "Row lock waits"   "${row_locks:-?}"
-            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${GRAY}%s${R}\n" \
-                "Aborted connects" "${aborted:-?}"
-        fi
-    } > "$C2"
-
-    render_two_cols "$C1" "$C2"
-    rm -f "$C1" "$C2"
-    hline '─' "$DGRAY"
-
-
 
     # ── FOOTER ───────────────────────────────────
     printf "\n"
