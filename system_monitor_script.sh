@@ -588,8 +588,7 @@ while true; do
     hline '─' "$DGRAY"
 
     # ════════════════════════════════════════════
-    #  BLOCK 3: Top URLs (left) | PHP Slowlog (right)
-    #  MySQL is now its own FULL-WIDTH block below
+    #  BLOCK 3: Top URLs (left) | WP-Login (right)
     # ════════════════════════════════════════════
     C1=$(mktemp); C2=$(mktemp)
 
@@ -611,34 +610,7 @@ while true; do
         rm -f "$url_temp"
     } > "$C1"
 
-    # RIGHT — PHP Slowlog
-    {
-        if [ -f "$SLOWLOG" ]; then
-            printf "${RED_S}${BOLD}  ▶  PHP SLOWLOG — TOP CULPRITS${R}\n"
-            printf "  ${DGRAY}%-${COL_SLOW_COUNT}s %-${COL_SLOW_DOM}s %s${R}\n" "COUNT" "DOMAIN" "PLUGIN"
-            printf "  ${DGRAY}%-${COL_SLOW_COUNT}s %-${COL_SLOW_DOM}s %s${R}\n" "──────" "────────────────────────" "──────────────────────"
-            grep "wp-content/plugins/" "$SLOWLOG" | \
-            sed -rn 's/.*\/domains\/([^/]+)\/.*plugins\/([^/ ]+).*/\1 \2/p' | \
-            sort | uniq -c | sort -nr | head -8 | \
-            awk -v o="${ORANGE}" -v g="${GREEN_S}" -v rs="${RED_S}" -v r="${R}" \
-                -v sc="$COL_SLOW_COUNT" -v sd="$COL_SLOW_DOM" -v sp="$COL_SLOW_PLUGIN" \
-                '{printf "  %s%-"sc"s%s  %s%-"sd"."sd"s%s  %s%-"sp"."sp"s%s\n", o,$1,r, g,$2,r, rs,$3,r}'
-        else
-            printf "${GRAY}${DIM}  ▶  PHP SLOWLOG${R}\n"
-            printf "  ${GRAY}${DIM}(slowlog not found at configured path)${R}\n"
-        fi
-    } > "$C2"
-
-    render_two_cols "$C1" "$C2"
-    rm -f "$C1" "$C2"
-    hline '─' "$DGRAY"
-
-    # ════════════════════════════════════════════
-    #  BLOCK 4: WP-Login (left) | Live Traffic (right)
-    # ════════════════════════════════════════════
-    C1=$(mktemp); C2=$(mktemp)
-
-    # LEFT — WP-Login
+    # RIGHT — WP-Login
     {
         wplogin_raw=$(grep "wp-login.php" $ACCESSLOG_PATH 2>/dev/null)
         if [ -n "$wplogin_raw" ]; then
@@ -676,52 +648,176 @@ while true; do
             printf "${GREEN_S}${BOLD}  ✔  WP-LOGIN.PHP${R}\n"
             printf "  ${GREEN_S}No suspicious activity detected.${R}\n"
         fi
-    } > "$C1"
-
-    # RIGHT — LIVE TRAFFIC VELOCITY
-    {
-        printf "${CYAN}${BOLD}  ▶  LIVE TRAFFIC VELOCITY (REAL-TIME 20s WINDOW)${R}\n"
-        printf "  ${DGRAY}%-${COL_VEL_HITS}s %-${COL_VEL_DOM}s %-${COL_VEL_IP}s %s${R}\n" \
-            "HITS" "DOMAIN" "IP ADDRESS" "STATUS/Δ"
-        printf "  ${DGRAY}%-${COL_VEL_HITS}s %-${COL_VEL_DOM}s %-${COL_VEL_IP}s %s${R}\n" \
-            "────" "────────────────────" "──────────────────────────" "────────"
-
-        LIVE_STATE="/tmp/live_velocity.state"
-        NEW_LIVE_STATE=$(mktemp)
-        CUR_MIN=$(date "+%d/%b/%Y:%H:%M")
-
-        for log in $ACCESSLOG_PATH; do
-            [ -f "$log" ] || continue
-            dom=$(echo "$log" | awk -F'/' '{print $5}')
-            tail -n 200 "$log" | grep "$CUR_MIN" | awk -v d="$dom" '{print d, $1}' >> "$NEW_LIVE_STATE"
-        done
-
-        if [ -s "$NEW_LIVE_STATE" ]; then
-            sort "$NEW_LIVE_STATE" | uniq -c | sort -nr | head -8 | while read -r count dom ip; do
-                [ -z "$ip" ] && continue
-                prev_live=$(grep "$dom $ip" "$LIVE_STATE" 2>/dev/null | awk '{print $1}')
-                if [ -n "$prev_live" ] && [ "$prev_live" -eq "$prev_live" ] 2>/dev/null; then
-                    diff=$((count - prev_live))
-                    if   [ "$diff" -gt 3 ]; then v_chg="${RED}${BOLD}↑+${diff}${R}"
-                    elif [ "$diff" -lt 0 ]; then v_chg="${GREEN_S}↓${diff}${R}"
-                    else v_chg="${DGRAY}steady${R}"
-                    fi
-                else
-                    v_chg="${BLUE_D}ACTIVE${R}"
-                fi
-                printf "  ${ORANGE}%-${COL_VEL_HITS}s${R}  ${GREEN_S}%-${COL_VEL_DOM}.${COL_VEL_DOM}s${R}  ${CYAN_S}%-${COL_VEL_IP}.${COL_VEL_IP}s${R}  %b\n" \
-                    "$count" "$dom" "$ip" "$v_chg"
-                echo "$count $dom $ip" >> "${NEW_LIVE_STATE}.final"
-            done
-            mv "${NEW_LIVE_STATE}.final" "$LIVE_STATE" 2>/dev/null
-        else
-            printf "  ${GRAY}${DIM}(waiting for new traffic...)${R}\n"
-        fi
-        rm -f "$NEW_LIVE_STATE"
     } > "$C2"
 
     render_two_cols "$C1" "$C2"
     rm -f "$C1" "$C2"
+    hline '─' "$DGRAY"
+
+    # ════════════════════════════════════════════
+    #  BLOCK 3b: PHP Slowlog (left) | spare (right)
+    # ════════════════════════════════════════════
+    C1=$(mktemp); C2=$(mktemp)
+
+    {
+        if [ -f "$SLOWLOG" ]; then
+            printf "${RED_S}${BOLD}  ▶  PHP SLOWLOG — TOP CULPRITS${R}\n"
+            printf "  ${DGRAY}%-${COL_SLOW_COUNT}s %-${COL_SLOW_DOM}s %s${R}\n" "COUNT" "DOMAIN" "PLUGIN"
+            printf "  ${DGRAY}%-${COL_SLOW_COUNT}s %-${COL_SLOW_DOM}s %s${R}\n" "──────" "────────────────────────" "──────────────────────"
+            grep "wp-content/plugins/" "$SLOWLOG" | \
+            sed -rn 's/.*\/domains\/([^/]+)\/.*plugins\/([^/ ]+).*/\1 \2/p' | \
+            sort | uniq -c | sort -nr | head -8 | \
+            awk -v o="${ORANGE}" -v g="${GREEN_S}" -v rs="${RED_S}" -v r="${R}" \
+                -v sc="$COL_SLOW_COUNT" -v sd="$COL_SLOW_DOM" -v sp="$COL_SLOW_PLUGIN" \
+                '{printf "  %s%-"sc"s%s  %s%-"sd"."sd"s%s  %s%-"sp"."sp"s%s\n", o,$1,r, g,$2,r, rs,$3,r}'
+        else
+            printf "${GRAY}${DIM}  ▶  PHP SLOWLOG${R}\n"
+            printf "  ${GRAY}${DIM}(slowlog not found at configured path)${R}\n"
+        fi
+    } > "$C1"
+    printf "" > "$C2"
+
+    render_two_cols "$C1" "$C2"
+    rm -f "$C1" "$C2"
+    hline '─' "$DGRAY"
+
+    # ════════════════════════════════════════════
+    #  BLOCK 4: LIVE TRAFFIC — FULL WIDTH
+    #
+    #  Top section:  per-IP velocity with delta
+    #  Bottom section: the actual recent request
+    #  lines from access logs so admin can see
+    #  exactly what URLs are being hit right now
+    # ════════════════════════════════════════════
+    {
+        LIVE_STATE="/tmp/live_velocity.state"
+        NEW_LIVE_STATE=$(mktemp)
+        CUR_MIN=$(date "+%d/%b/%Y:%H:%M")
+
+        # Collect current-minute hits across all domains
+        # Format per line: DOMAIN IP METHOD URL STATUS
+        for log in $ACCESSLOG_PATH; do
+            [ -f "$log" ] || continue
+            dom=$(echo "$log" | awk -F'/' '{print $5}')
+            tail -n 500 "$log" | grep "$CUR_MIN" | \
+                awk -v d="$dom" '{
+                    ip=$1; method=$6; url=$7; status=$9
+                    gsub(/"/,"",method)
+                    print d, ip, method, url, status
+                }' >> "$NEW_LIVE_STATE"
+        done
+
+        # ── Section 1: per-IP velocity summary ──
+        COL_LV_HITS=6
+        COL_LV_DOM=$(( HALF - COL_LV_HITS - 30 - 10 - 6 ))
+        [ "$COL_LV_DOM" -lt 16 ] && COL_LV_DOM=16
+        COL_LV_IP=28
+        COL_LV_DELTA=10
+
+        printf "${CYAN}${BOLD}  ▶  LIVE TRAFFIC VELOCITY  ${DGRAY}(current minute: %s)${R}\n" "$CUR_MIN"
+        printf "  ${DGRAY}%-${COL_LV_HITS}s  %-${COL_LV_DOM}s  %-${COL_LV_IP}s  %s${R}\n" \
+            "HITS" "DOMAIN" "IP ADDRESS" "Δ STATUS"
+        printf "  ${DGRAY}%-${COL_LV_HITS}s  %-${COL_LV_DOM}s  %-${COL_LV_IP}s  %s${R}\n" \
+            "──────" "$(printf '─%.0s' $(seq 1 $COL_LV_DOM))" \
+            "$(printf '─%.0s' $(seq 1 $COL_LV_IP))" "──────────"
+
+        if [ -s "$NEW_LIVE_STATE" ]; then
+            # Aggregate by domain+IP for the velocity summary
+            awk '{print $1, $2}' "$NEW_LIVE_STATE" | \
+            sort | uniq -c | sort -nr | head -8 | \
+            while read -r count dom ip; do
+                [ -z "$ip" ] && continue
+                prev_live=$(grep "^$dom $ip " "$LIVE_STATE" 2>/dev/null | awk '{print $3}')
+                if [ -n "$prev_live" ] && [ "$prev_live" -eq "$prev_live" ] 2>/dev/null; then
+                    diff=$(( count - prev_live ))
+                    if   [ "$diff" -gt 3 ]; then v_chg="${RED}${BOLD}↑ +${diff}${R}"
+                    elif [ "$diff" -lt 0 ]; then v_chg="${GREEN_S}↓ ${diff}${R}"
+                    else                          v_chg="${DGRAY}steady${R}"
+                    fi
+                else
+                    v_chg="${ORANGE}${BOLD}NEW${R}"
+                fi
+                printf "  ${ORANGE}%-${COL_LV_HITS}s${R}  ${GREEN_S}%-${COL_LV_DOM}.${COL_LV_DOM}s${R}  ${CYAN_S}%-${COL_LV_IP}.${COL_LV_IP}s${R}  %b\n" \
+                    "$count" "$dom" "$ip" "$v_chg"
+                # Save for next-cycle delta
+                echo "$dom $ip $count" >> "${NEW_LIVE_STATE}.vel"
+            done
+            mv "${NEW_LIVE_STATE}.vel" "$LIVE_STATE" 2>/dev/null
+        else
+            printf "  ${GRAY}${DIM}(no traffic in current minute window)${R}\n"
+        fi
+
+        # ── Section 2: recent raw request lines ──
+        # Compute URL column: TW minus fixed columns and padding
+        COL_RU_TIME=6    # HH:MM:SS
+        COL_RU_DOM=20
+        COL_RU_IP=16
+        COL_RU_METHOD=7
+        COL_RU_STATUS=6
+        COL_RU_URL=$(( TW - COL_RU_TIME - COL_RU_DOM - COL_RU_IP - COL_RU_METHOD - COL_RU_STATUS - 14 ))
+        [ "$COL_RU_URL" -lt 30 ] && COL_RU_URL=30
+
+        printf "\n"
+        printf "  ${CYAN}${DIM}▶  RECENT REQUESTS  ${DGRAY}(last 20 hits across all domains)${R}\n"
+        printf "  ${DGRAY}%-${COL_RU_TIME}s  %-${COL_RU_DOM}s  %-${COL_RU_IP}s  %-${COL_RU_METHOD}s  %-${COL_RU_URL}s  %s${R}\n" \
+            "TIME" "DOMAIN" "IP" "METHOD" "URL" "STATUS"
+        printf "  ${DGRAY}%-${COL_RU_TIME}s  %-${COL_RU_DOM}s  %-${COL_RU_IP}s  %-${COL_RU_METHOD}s  %-${COL_RU_URL}s  %s${R}\n" \
+            "──────" "$(printf '─%.0s' $(seq 1 $COL_RU_DOM))" \
+            "$(printf '─%.0s' $(seq 1 $COL_RU_IP))" "───────" \
+            "$(printf '─%.0s' $(seq 1 $COL_RU_URL))" "──────"
+
+        # Pull last 20 lines across all logs, sorted by timestamp descending
+        # Access log format: IP - - [DD/Mon/YYYY:HH:MM:SS +TZ] "METHOD URL PROTO" STATUS ...
+        for log in $ACCESSLOG_PATH; do
+            [ -f "$log" ] || continue
+            dom=$(echo "$log" | awk -F'/' '{print $5}')
+            tail -n 100 "$log" | awk -v d="$dom" '{
+                ip=$1
+                # Extract time HH:MM:SS from field 4 e.g. [25/Feb/2026:14:32:11
+                split($4, ts, ":"); time = ts[2]":"ts[3]":"ts[4]
+                method=$6; gsub(/"/,"",method)
+                url=$7
+                status=$9
+                # Full sortable timestamp for ordering across domains
+                sort_ts=$4; gsub(/\[/,"",sort_ts)
+                print sort_ts, d, ip, time, method, url, status
+            }'
+        done | sort -rk1,1 | head -20 | \
+        awk -v dom_w="$COL_RU_DOM" -v ip_w="$COL_RU_IP" \
+            -v url_w="$COL_RU_URL" -v meth_w="$COL_RU_METHOD" \
+            -v stat_w="$COL_RU_STATUS" \
+            -v g="${GREEN_S}" -v c="${CYAN_S}" -v o="${ORANGE}" \
+            -v y="${YELLOW}" -v gr="${GRAY}" -v r="${R}" \
+            -v re="${RED}" -v b="${BOLD}" -v rs="${RED_S}" '
+        {
+            # $1=sort_ts $2=domain $3=ip $4=HH:MM:SS $5=method $6=url $7=status
+            dom=$2; ip=$3; ts=$4; meth=$5; url=$6; status=$7
+
+            # colour by HTTP status
+            if      (status+0 >= 500) sc = re b
+            else if (status+0 >= 400) sc = o
+            else if (status+0 >= 300) sc = y
+            else                      sc = g
+
+            # colour by method
+            if      (meth == "\"POST")  mc = rs
+            else if (meth == "\"GET")   mc = c
+            else                        mc = gr
+
+            # truncate url to column width
+            if (length(url) > url_w) url = substr(url,1,url_w-1)"…"
+
+            printf "  %s%-6s%s  %s%-"dom_w"."dom_w"s%s  %s%-"ip_w"."ip_w"s%s  %s%-"meth_w"."meth_w"s%s  %s%-"url_w"s%s  %s%s%s\n",
+                gr, ts, r,
+                g,  dom, r,
+                c,  ip,  r,
+                mc, meth, r,
+                y,  url, r,
+                sc, status, r
+        }'
+
+        rm -f "$NEW_LIVE_STATE"
+    }
     hline '─' "$DGRAY"
 
     # ════════════════════════════════════════════
