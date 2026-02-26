@@ -494,13 +494,63 @@ while true; do
 
     # RIGHT — WP-Login
     {
+        WL_NOW=$(date "+%H:%M:%S")
+        WL_CUR_MIN=$(date "+%d/%b/%Y:%H:%M")
+        WL_PREV_MIN=$(date -d "1 minute ago" "+%d/%b/%Y:%H:%M" 2>/dev/null || \
+                      date -v-1M "+%d/%b/%Y:%H:%M" 2>/dev/null)  # Linux / macOS fallback
+
         wplogin_raw=$(grep "wp-login.php" $ACCESSLOG_PATH 2>/dev/null)
-        if [ -n "$wplogin_raw" ]; then
-            printf "${RED}${BOLD}${BLINK}  ⚠  WP-LOGIN.PHP DETECTED${R}\n"
+
+        # ── Determine if there are RECENT hits (current or prev minute) ──
+        # This drives the status indicator colour — red blink if active
+        # right now, green blink if clean, orange if hits exist but older
+        wplogin_recent=$(echo "$wplogin_raw" | grep -c "${WL_CUR_MIN}\|${WL_PREV_MIN}" 2>/dev/null || echo 0)
+        wplogin_recent=$(( ${wplogin_recent:-0} + 0 ))
+        wplogin_total=$(echo "$wplogin_raw" | grep -c "wp-login" 2>/dev/null || echo 0)
+        wplogin_total=$(( ${wplogin_total:-0} + 0 ))
+
+        # ── Status indicator: coloured blinking dot + time ────────────────
+        if [ "$wplogin_recent" -gt 0 ]; then
+            # Active hits in last ~2 minutes — red alert
+            status_dot="${RED}${BOLD}${BLINK}●${R}"
+            status_label="${RED}${BOLD}${BLINK}  ⚠  WP-LOGIN.PHP — ACTIVE ATTACK${R}"
+        elif [ "$wplogin_total" -gt 0 ]; then
+            # Hits exist in log but not recent — orange warning
+            status_dot="${ORANGE}${BOLD}●${R}"
+            status_label="${ORANGE}${BOLD}  ⚠  WP-LOGIN.PHP — PRIOR HITS${R}"
+        else
+            # Completely clean — green all clear
+            status_dot="${GREEN_S}${BOLD}${BLINK}●${R}"
+            status_label="${GREEN_S}${BOLD}  ✔  WP-LOGIN.PHP — CLEAR${R}"
+        fi
+
+        # ── Header line with status dot and current time on right ────────
+        # Calculate padding to right-align the time within the half-column
+        label_vis="  WP-LOGIN.PHP MONITOR"
+        time_str="as of ${WL_NOW}"
+        pad=$(( HALF - ${#label_vis} - ${#time_str} - 4 ))
+        [ "$pad" -lt 1 ] && pad=1
+        printf "  %b ${DGRAY}WP-LOGIN.PHP MONITOR%*s${DIM}%s${R}\n" \
+            "$status_dot" "$pad" "" "$time_str"
+
+        # ── Status label ─────────────────────────────────────────────────
+        printf "%b\n" "$status_label"
+
+        if [ "$wplogin_total" -gt 0 ]; then
+            # ── Recent hit rate summary ───────────────────────────────────
+            printf "  ${DGRAY}Total hits in log:${R} ${ORANGE}${BOLD}%s${R}  " "$wplogin_total"
+            printf "${DGRAY}Active (last 2m):${R} "
+            if [ "$wplogin_recent" -gt 0 ]; then
+                printf "${RED}${BOLD}${BLINK}%s${R}\n" "$wplogin_recent"
+            else
+                printf "${GREEN_S}0${R}\n"
+            fi
+
             printf "  ${DGRAY}%-${COL_WL_HITS}s %-${COL_WL_DOM}s %-${COL_WL_IP}s %-${COL_WL_METHOD}s %s${R}\n" \
                 "HITS" "DOMAIN" "IP" "METHOD" "LAST SEEN"
             printf "  ${DGRAY}%-${COL_WL_HITS}s %-${COL_WL_DOM}s %-${COL_WL_IP}s %-${COL_WL_METHOD}s %s${R}\n" \
                 "────" "────────────────────" "──────────────────────────" "──────" "──────────────"
+
             echo "$wplogin_raw" | awk '{
                 match($0, /access\.log:/);
                 if (RSTART > 0) {
@@ -520,15 +570,17 @@ while true; do
                         split(i, sep, SUBSEP)
                         print count[i], sep[1], sep[2], sep[3], last_ts[i]
                     }
-                }' | sort -nr | head -8 | \
+                }' | sort -nr | head -6 | \
             while read -r hits domain ip method ts; do
+                # Highlight rows with recent activity
+                echo "$wplogin_raw" | grep -q "$ip.*${WL_CUR_MIN}\|$ip.*${WL_PREV_MIN}" \
+                    && row_col="${RED}" || row_col="${ORANGE}"
                 [ "$method" = "POST" ] && mfmt="${RED}${BOLD}[POST]${R}" || mfmt="${GREEN_S}[GET] ${R}"
-                printf "  ${ORANGE}%-${COL_WL_HITS}s${R}  ${GREEN_S}%-${COL_WL_DOM}.${COL_WL_DOM}s${R}  ${CYAN_S}%-${COL_WL_IP}.${COL_WL_IP}s${R}  %b  ${GRAY}%s${R}\n" \
+                printf "  ${row_col}%-${COL_WL_HITS}s${R}  ${GREEN_S}%-${COL_WL_DOM}.${COL_WL_DOM}s${R}  ${CYAN_S}%-${COL_WL_IP}.${COL_WL_IP}s${R}  %b  ${GRAY}%s${R}\n" \
                     "$hits" "$domain" "$ip" "$mfmt" "$ts"
             done
         else
-            printf "${GREEN_S}${BOLD}  ✔  WP-LOGIN.PHP${R}\n"
-            printf "  ${GREEN_S}No suspicious activity detected.${R}\n"
+            printf "  ${GREEN_S}No wp-login.php hits in access logs.${R}\n"
         fi
     } > "$C2"
 
