@@ -175,6 +175,239 @@ render_two_cols() {
 }
 
 # ════════════════════════════════════════════════
+#  EXIT REPORT — triggered on Ctrl+C (SIGINT)
+#  Collects live data at exit time and writes a
+#  clean plain-text report to /tmp/monitor_report_TIMESTAMP.txt
+#  then prints it to the terminal.
+# ════════════════════════════════════════════════
+generate_report() {
+    local RPT="/tmp/monitor_report_$(date '+%Y%m%d_%H%M%S').txt"
+    local NOW_FULL=$(date "+%A, %d %b %Y  %H:%M:%S")
+    local HOST=$(hostname -s 2>/dev/null || echo "server")
+    local LOAD=$(uptime | awk -F'load average:' '{print $2}' | xargs)
+    local UPTIME_S=$(uptime -p 2>/dev/null | sed 's/up //')
+
+    {
+    echo "════════════════════════════════════════════════════════════════"
+    echo "  SERVER PERFORMANCE REPORT"
+    echo "  Generated : ${NOW_FULL}"
+    echo "  Host      : ${HOST}"
+    echo "  Uptime    : ${UPTIME_S}"
+    echo "  Load avg  : ${LOAD}"
+    echo "════════════════════════════════════════════════════════════════"
+    echo ""
+
+    # ── 1. TOP CPU PROCESSES ─────────────────────────────────────────
+    echo "┌─────────────────────────────────────────────────────────────"
+    echo "│  TOP CPU-CONSUMING PROCESSES"
+    echo "├─────────────────────────────────────────────────────────────"
+    ps -eo comm,%cpu --sort=-%cpu 2>/dev/null | awk 'NR>1&&NR<=6{
+        printf "│  %-3d  %-36s  %s%%\n", NR-1, $1, $2}'
+    echo "└─────────────────────────────────────────────────────────────"
+    echo ""
+
+    # ── 2. TOP MEMORY PROCESSES ──────────────────────────────────────
+    echo "┌─────────────────────────────────────────────────────────────"
+    echo "│  TOP MEMORY-CONSUMING PROCESSES"
+    echo "├─────────────────────────────────────────────────────────────"
+    ps -eo comm,%mem --sort=-%mem 2>/dev/null | awk 'NR>1&&NR<=6{
+        printf "│  %-3d  %-36s  %s%%\n", NR-1, $1, $2}'
+    echo "└─────────────────────────────────────────────────────────────"
+    echo ""
+
+    # ── 3. TOP URLS (all-time from access logs) ──────────────────────
+    echo "┌─────────────────────────────────────────────────────────────"
+    echo "│  TOP URLs BY HIT COUNT  (from access logs)"
+    echo "├─────────────────────────────────────────────────────────────"
+    local url_tmp=$(mktemp)
+    for logfile in $ACCESSLOG_PATH; do
+        [ -f "$logfile" ] || continue
+        domain=$(echo "$logfile" | awk -F'/' '{print $5}')
+        awk -v dom="$domain" '{print dom, $7}' "$logfile" 2>/dev/null
+    done | sort | uniq -c | sort -nr | head -10 > "$url_tmp"
+    awk '{printf "│  %-8s  %-28s  %s\n", $1, $2, $3}' "$url_tmp"
+    rm -f "$url_tmp"
+    echo "└─────────────────────────────────────────────────────────────"
+    echo ""
+
+    # ── 4. TOP IPs (all-time from access logs) ────────────────────────
+    echo "┌─────────────────────────────────────────────────────────────"
+    echo "│  TOP IPs HITTING THE SERVER  (from access logs)"
+    echo "├─────────────────────────────────────────────────────────────"
+    awk '{print $1}' $ACCESSLOG_PATH 2>/dev/null | \
+        sort | uniq -c | sort -nr | head -10 | \
+        awk '{printf "│  %-8s  %s\n", $1, $2}'
+    echo "└─────────────────────────────────────────────────────────────"
+    echo ""
+
+    # ── 5. LIVE URL HITS (current minute window) ──────────────────────
+    echo "┌─────────────────────────────────────────────────────────────"
+    echo "│  TOP URLs THIS MINUTE  (live window)"
+    echo "├─────────────────────────────────────────────────────────────"
+    local CUR_MIN=$(date "+%d/%b/%Y:%H:%M")
+    local live_tmp=$(mktemp)
+    for log in $ACCESSLOG_PATH; do
+        [ -f "$log" ] || continue
+        dom=$(echo "$log" | awk -F'/' '{print $5}')
+        tail -n 500 "$log" | grep "$CUR_MIN" | \
+            awk -v d="$dom" '{print d, $1, $7}' >> "$live_tmp"
+    done
+    if [ -s "$live_tmp" ]; then
+        sort "$live_tmp" | uniq -c | sort -nr | head -10 | \
+            awk '{printf "│  %-6s hits  %-28s  %-18s  %s\n", $1, $2, $3, $4}'
+    else
+        echo "│  (no traffic in current minute)"
+    fi
+    rm -f "$live_tmp"
+    echo "└─────────────────────────────────────────────────────────────"
+    echo ""
+
+    # ── 6. TOP 3 IPs IN LIVE WINDOW ───────────────────────────────────
+    echo "┌─────────────────────────────────────────────────────────────"
+    echo "│  TOP 3 IPs THIS MINUTE  (live window)"
+    echo "├─────────────────────────────────────────────────────────────"
+    local live_ip_tmp=$(mktemp)
+    for log in $ACCESSLOG_PATH; do
+        [ -f "$log" ] || continue
+        dom=$(echo "$log" | awk -F'/' '{print $5}')
+        tail -n 500 "$log" | grep "$CUR_MIN" | \
+            awk -v d="$dom" '{print d, $1}' >> "$live_ip_tmp"
+    done
+    if [ -s "$live_ip_tmp" ]; then
+        sort "$live_ip_tmp" | uniq -c | sort -nr | head -3 | \
+            awk '{printf "│  %-6s hits  %-28s  %s\n", $1, $2, $3}'
+    else
+        echo "│  (no traffic in current minute)"
+    fi
+    rm -f "$live_ip_tmp"
+    echo "└─────────────────────────────────────────────────────────────"
+    echo ""
+
+    # ── 7. PHP SLOWLOG — TOP PLUGIN + MOST FREQUENT STACK FRAMES ────────
+    echo "┌─────────────────────────────────────────────────────────────"
+    echo "│  PHP SLOWLOG — TOP OFFENDING PLUGIN + MOST COMMON CALL STACK"
+    echo "├─────────────────────────────────────────────────────────────"
+    if [ -f "$SLOWLOG" ]; then
+        # Find the single most-frequent plugin
+        TOP_PLUGIN=$(grep "wp-content/plugins/" "$SLOWLOG" | \
+            sed -rn 's/.*\/plugins\/([^/ ]+).*/\1/p' | \
+            sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+
+        if [ -n "$TOP_PLUGIN" ]; then
+            TOP_COUNT=$(grep -c "$TOP_PLUGIN" "$SLOWLOG" | tr -d '[:space:]')
+            TOP_DOM=$(grep "wp-content/plugins/$TOP_PLUGIN" "$SLOWLOG" | \
+                sed -rn 's/.*\/domains\/([^/]+)\/.*/\1/p' | \
+                sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+
+            echo "│"
+            printf "│  Plugin      : %s\n"  "$TOP_PLUGIN"
+            printf "│  Domain      : %s\n"  "${TOP_DOM:-unknown}"
+            printf "│  Slow entries: %s\n"  "$TOP_COUNT"
+            echo "│"
+            echo "│  Most frequently occurring stack frames"
+            echo "│  (ranked by how often each frame appears across all slow entries):"
+            echo "│  ──────────────────────────────────────────────────────────────"
+
+            # Two-pass approach:
+            # Pass 1 — collect all stack frame lines from the ENTIRE slowlog
+            #           that belong to entries mentioning this plugin.
+            #           We do this by reading the file once in awk, tracking
+            #           which entries contain the plugin, then emitting their frames.
+            # Pass 2 — strip hex address, shorten paths, count+rank by frequency.
+
+            awk -v plugin="$TOP_PLUGIN" '
+            BEGIN { entry_count = 0; frame_count = 0 }
+
+            # New entry starts with "# Time:"
+            /^# Time:/ {
+                # Flush previous entry if it contained the plugin
+                if (has_plugin) {
+                    for (i = 0; i < nframes; i++)
+                        print frames[i]
+                }
+                has_plugin = 0
+                nframes = 0
+                next
+            }
+
+            # Stack frame lines start with [0x
+            /^\[0x/ {
+                # Strip the hex address token — everything after "] "
+                line = $0
+                sub(/^\[0x[0-9a-fA-F]+\] /, "", line)
+                # Shorten path
+                sub(/\/home\/nginx\/domains\/[^\/]*\/public\//, "", line)
+                frames[nframes++] = line
+                if (line ~ plugin) has_plugin = 1
+                next
+            }
+
+            # Any other line (# script_filename, # Wall time, blank) — skip
+            END {
+                # Flush last entry
+                if (has_plugin)
+                    for (i = 0; i < nframes; i++)
+                        print frames[i]
+            }
+            ' "$SLOWLOG" | \
+            sort | uniq -c | sort -rn | head -20 | \
+            while IFS= read -r ranked_line; do
+                count=$(echo "$ranked_line" | awk '{print $1}')
+                frame=$(echo "$ranked_line" | cut -d' ' -f2-)
+                printf "│  [%3dx]  %s\n" "$count" "$frame"
+            done
+
+            echo "│"
+            echo "│  Note: [Nx] = times this frame appeared across all slow entries"
+        else
+            echo "│  (no plugin entries found in slowlog)"
+        fi
+    else
+        echo "│  (slowlog not found at: $SLOWLOG)"
+    fi
+    echo "└─────────────────────────────────────────────────────────────"
+    echo ""
+
+    # ── 8. WP-LOGIN STATUS ────────────────────────────────────────────
+    echo "┌─────────────────────────────────────────────────────────────"
+    echo "│  WP-LOGIN.PHP ACTIVITY"
+    echo "├─────────────────────────────────────────────────────────────"
+    local wl_total=$(grep "wp-login.php" $ACCESSLOG_PATH 2>/dev/null | wc -l | tr -d '[:space:]')
+    wl_total=$(( ${wl_total:-0} + 0 ))
+    if [ "$wl_total" -gt 0 ]; then
+        echo "│  ⚠  Total wp-login.php hits in logs: $wl_total"
+        echo "│"
+        echo "│  Top offending IPs:"
+        grep "wp-login.php" $ACCESSLOG_PATH 2>/dev/null | \
+            awk '{print $1}' | sort | uniq -c | sort -nr | head -5 | \
+            awk '{printf "│    %-8s  %s\n", $1, $2}'
+    else
+        echo "│  ✔  No wp-login.php hits detected"
+    fi
+    echo "└─────────────────────────────────────────────────────────────"
+    echo ""
+
+    echo "════════════════════════════════════════════════════════════════"
+    echo "  End of report  •  $(date '+%H:%M:%S')"
+    echo "════════════════════════════════════════════════════════════════"
+
+    } | tee "$RPT"
+
+    echo ""
+    echo "  Report saved to: $RPT"
+}
+
+# Trap Ctrl+C — generate report then exit cleanly
+trap '
+    echo ""
+    echo "  Generating exit report..."
+    echo ""
+    generate_report
+    rm -f "$FRAME"
+    exit 0
+' INT
+
+# ════════════════════════════════════════════════
 FRAME=$(mktemp)
 while true; do
 
