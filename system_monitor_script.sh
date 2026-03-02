@@ -397,12 +397,631 @@ generate_report() {
     echo "  Report saved to: $RPT"
 }
 
-# Trap Ctrl+C — generate report then exit cleanly
+# ════════════════════════════════════════════════
+#  HTML REPORT — writes directly to this server's
+#  web root so hostname/report.html always shows
+#  the latest snapshot taken at Ctrl+C.
+#
+#  Configure these two paths:
+# ════════════════════════════════════════════════
+REPORT_WEBROOT="/usr/local/nginx/html"
+REPORT_SUBDIR="reports"    # reports written to /usr/local/nginx/html/reports/
+REPORT_BASE_URL=""          # override auto-detected URL, e.g. "https://14643.bigscoots-wpo.com"
+
+# Optional: also POST JSON to a remote ingest endpoint
+REPORT_ENDPOINT=""          # e.g. https://reports.yoursite.com/ingest.php
+REPORT_TOKEN="changeme123"
+
+# ── Helper: escape for HTML output ───────────
+html_e() { printf '%s' "$1" | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g;s/"/\&quot;/g'; }
+
+# ── Helper: escape a string for JSON ─────────
+json_str() {
+    printf '%s' "$1" | sed \
+        -e 's/\\/\\\\/g' \
+        -e 's/"/\\"/g'   \
+        -e 's/	/\\t/g'   \
+        -e ':a;N;$!ba;s/\n/\\n/g'
+}
+
+generate_html_report() {
+    local NOW_FULL=$(date "+%A, %d %b %Y  %H:%M:%S")
+    local NOW_SLUG=$(date '+%Y-%m-%d_%H-%M-%S')
+    local HOST_FULL=$(hostname -f 2>/dev/null || hostname -s 2>/dev/null || echo "server")
+    local HOST_SHORT=$(hostname -s 2>/dev/null || echo "server")
+    local LOAD=$(uptime | awk -F'load average:' '{print $2}' | xargs)
+    local UPTIME_S=$(uptime -p 2>/dev/null | sed 's/up //')
+    local CUR_MIN=$(date "+%d/%b/%Y:%H:%M")
+
+    # ── Resolve output paths ──────────────────
+    local PUB_DIR="$REPORT_WEBROOT"
+    [ -n "$REPORT_SUBDIR" ] && PUB_DIR="${REPORT_WEBROOT}/${REPORT_SUBDIR}"
+
+    # ── Build the public base URL from hostname ───
+    # Uses HTTPS + the fully-qualified hostname.
+    # Override by setting REPORT_BASE_URL in the config block above.
+    local PUBLIC_BASE="${REPORT_BASE_URL:-https://${HOST_FULL}}"
+    # Strip any trailing slash
+    PUBLIC_BASE="${PUBLIC_BASE%/}"
+
+    # Full URLs for this report and the latest redirect
+    local REPORT_URL="${PUBLIC_BASE}/${REPORT_SUBDIR}/${NOW_SLUG}.html"
+    [ -z "$REPORT_SUBDIR" ] && REPORT_URL="${PUBLIC_BASE}/${NOW_SLUG}.html"
+    local LATEST_URL="${PUBLIC_BASE}/report.html"
+    local INDEX_URL="${PUBLIC_BASE}/${REPORT_SUBDIR}/"
+    [ -z "$REPORT_SUBDIR" ] && INDEX_URL="${PUBLIC_BASE}/"
+
+    # Fall back to /tmp if web root doesn't exist
+    if [ ! -d "$REPORT_WEBROOT" ]; then
+        PUB_DIR="/tmp/monitor_reports"
+        echo "  ⚠  Web root not found ($REPORT_WEBROOT), writing to $PUB_DIR"
+    fi
+
+    mkdir -p "$PUB_DIR" 2>/dev/null
+
+    local HTML_FILE="${PUB_DIR}/${NOW_SLUG}.html"
+    local LATEST_LINK="${REPORT_WEBROOT}/report.html"
+
+    # ── Collect data ──────────────────────────
+
+    # CPU
+    local cpu_rows=""
+    while read -r proc pct; do
+        local bar_w=$(echo "$pct" | awk '{v=int($1*2); if(v>100)v=100; print v}')
+        local col; col=$(awk -v p="$pct" 'BEGIN{if(p+0>=50)print "#ff4757"; else if(p+0>=20)print "#ffa502"; else print "#39d98a"}')
+        cpu_rows+="<tr><td>$(html_e "$proc")</td><td><div class='bar-wrap'><div class='bar-track'><div class='bar-fill' style='width:${bar_w}%;background:${col}'></div></div><span style='color:${col}'>${pct}%</span></div></td></tr>"
+    done < <(ps -eo comm,%cpu --sort=-%cpu 2>/dev/null | awk 'NR>1&&NR<=8{print $1,$2}')
+
+    # Memory
+    local mem_rows=""
+    while read -r proc pct; do
+        local bar_w=$(echo "$pct" | awk '{v=int($1*5); if(v>100)v=100; print v}')
+        local col; col=$(awk -v p="$pct" 'BEGIN{if(p+0>=20)print "#ff4757"; else if(p+0>=10)print "#ffa502"; else print "#00d4ff"}')
+        mem_rows+="<tr><td>$(html_e "$proc")</td><td><div class='bar-wrap'><div class='bar-track'><div class='bar-fill' style='width:${bar_w}%;background:${col}'></div></div><span style='color:${col}'>${pct}%</span></div></td></tr>"
+    done < <(ps -eo comm,%mem --sort=-%mem 2>/dev/null | awk 'NR>1&&NR<=8{print $1,$2}')
+
+    # Top URLs all-time
+    local url_tmp=$(mktemp)
+    for logfile in $ACCESSLOG_PATH; do
+        [ -f "$logfile" ] || continue
+        domain=$(echo "$logfile" | awk -F'/' '{print $5}')
+        awk -v dom="$domain" '{print dom, $7}' "$logfile" 2>/dev/null
+    done | sort | uniq -c | sort -nr | head -10 > "$url_tmp"
+    local url_rows=""
+    while read -r hits dom url; do
+        url_rows+="<tr><td><span class='pill'>${hits}</span></td><td class='dim'>$(html_e "$dom")</td><td class='url-cell'>$(html_e "$url")</td></tr>"
+    done < "$url_tmp"
+    rm -f "$url_tmp"
+
+    # Top IPs all-time
+    local max_ip_hits=1
+    local ip_tmp=$(mktemp)
+    awk '{print $1}' $ACCESSLOG_PATH 2>/dev/null | sort | uniq -c | sort -nr | head -10 > "$ip_tmp"
+    max_ip_hits=$(head -1 "$ip_tmp" | awk '{print $1+0}'); [ "${max_ip_hits:-0}" -eq 0 ] && max_ip_hits=1
+    local ip_rows=""
+    while read -r hits ip; do
+        local bw=$(awk -v h="$hits" -v m="$max_ip_hits" 'BEGIN{printf "%d", h/m*100}')
+        ip_rows+="<tr><td><span class='pill pill-orange'>${hits}</span></td><td class='ip-cell'>$(html_e "$ip")</td><td><div class='bar-track'><div class='bar-fill' style='width:${bw}%;background:#ff6b35'></div></div></td></tr>"
+    done < "$ip_tmp"
+    rm -f "$ip_tmp"
+
+    # Live URLs
+    local live_tmp=$(mktemp)
+    for log in $ACCESSLOG_PATH; do
+        [ -f "$log" ] || continue
+        dom=$(echo "$log" | awk -F'/' '{print $5}')
+        tail -n 500 "$log" | grep "$CUR_MIN" | \
+            awk -v d="$dom" '{print d, $1, $7}' >> "$live_tmp"
+    done
+    local live_url_rows=""
+    if [ -s "$live_tmp" ]; then
+        while read -r hits dom ip url; do
+            live_url_rows+="<tr><td><span class='pill pill-green'>${hits}</span></td><td class='dim'>$(html_e "$dom")</td><td class='ip-cell'>$(html_e "$ip")</td><td class='url-cell'>$(html_e "$url")</td></tr>"
+        done < <(sort "$live_tmp" | uniq -c | sort -nr | head -10)
+    else
+        live_url_rows="<tr><td colspan='4' class='empty'>No traffic in current minute window</td></tr>"
+    fi
+
+    # Live top 3 IPs
+    local live_ip_rows=""
+    if [ -s "$live_tmp" ]; then
+        local max_live=1
+        max_live=$(awk '{print $2}' "$live_tmp" | sort | uniq -c | sort -nr | head -1 | awk '{print $1+0}')
+        [ "${max_live:-0}" -eq 0 ] && max_live=1
+        while read -r hits dom ip; do
+            local bw=$(awk -v h="$hits" -v m="$max_live" 'BEGIN{printf "%d", h/m*100}')
+            live_ip_rows+="<tr><td><span class='pill pill-green'>${hits}</span></td><td class='dim'>$(html_e "$dom")</td><td class='ip-cell'>$(html_e "$ip")</td><td><div class='bar-track'><div class='bar-fill' style='width:${bw}%;background:#39d98a'></div></div></td></tr>"
+        done < <(awk '{print $1, $2}' "$live_tmp" | sort | uniq -c | sort -nr | head -3)
+    else
+        live_ip_rows="<tr><td colspan='4' class='empty'>No traffic in current minute window</td></tr>"
+    fi
+    rm -f "$live_tmp"
+
+    # WP Login
+    local wl_total=$(grep "wp-login.php" $ACCESSLOG_PATH 2>/dev/null | wc -l | tr -d '[:space:]')
+    wl_total=$(( ${wl_total:-0} + 0 ))
+    local wl_status_class="ok" wl_status_text="No wp-login.php hits detected" wl_dot_class="ok"
+    [ "$wl_total" -gt 0 ] && { wl_status_class="alert"; wl_dot_class="alert"; wl_status_text="Login page hits detected"; }
+    local wl_ip_rows=""
+    if [ "$wl_total" -gt 0 ]; then
+        while read -r hits ip; do
+            wl_ip_rows+="<tr><td><span class='pill pill-red'>${hits}</span></td><td class='ip-cell'>$(html_e "$ip")</td></tr>"
+        done < <(grep "wp-login.php" $ACCESSLOG_PATH 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -nr | head -5)
+    fi
+
+    # PHP Slowlog
+    local sl_plugin="" sl_domain="" sl_count="0" sl_frame_rows=""
+    if [ -f "$SLOWLOG" ]; then
+        sl_plugin=$(grep "wp-content/plugins/" "$SLOWLOG" | \
+            sed -rn 's/.*\/plugins\/([^/ ]+).*/\1/p' | \
+            sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+        if [ -n "$sl_plugin" ]; then
+            sl_count=$(grep -c "$sl_plugin" "$SLOWLOG" | tr -d '[:space:]')
+            sl_domain=$(grep "wp-content/plugins/$sl_plugin" "$SLOWLOG" | \
+                sed -rn 's/.*\/domains\/([^/]+)\/.*/\1/p' | \
+                sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+
+            local max_frame=1
+            local frames_tmp=$(mktemp)
+            awk -v plugin="$sl_plugin" '
+            BEGIN { has_plugin = 0; nframes = 0 }
+            /^# Time:/ {
+                if (has_plugin) for (i=0;i<nframes;i++) print frames[i]
+                has_plugin=0; nframes=0; next
+            }
+            /^\[0x/ {
+                line=$0
+                sub(/^\[0x[0-9a-fA-F]+\] /,"",line)
+                sub(/\/home\/nginx\/domains\/[^\/]*\/public\//,"",line)
+                gsub(/"/,"\\\"",line)
+                frames[nframes++]=line
+                if(line~plugin) has_plugin=1
+                next
+            }
+            END { if(has_plugin) for(i=0;i<nframes;i++) print frames[i] }
+            ' "$SLOWLOG" | sort | uniq -c | sort -rn | head -20 > "$frames_tmp"
+
+            max_frame=$(head -1 "$frames_tmp" | awk '{print $1+0}'); [ "${max_frame:-0}" -eq 0 ] && max_frame=1
+
+            while IFS= read -r ranked_line; do
+                local cnt=$(echo "$ranked_line" | awk '{print $1}')
+                local frame=$(echo "$ranked_line" | cut -d' ' -f2-)
+                local bw=$(awk -v c="$cnt" -v m="$max_frame" 'BEGIN{printf "%d", c/m*100}')
+                # Split into function / path / line for colouring
+                local fn_part path_part line_part
+                fn_part=$(echo "$frame"  | grep -oP '^[^\s]+\(\)')
+                path_part=$(echo "$frame" | grep -oP '(?<=\(\) ).+(?=:\d+$)')
+                line_part=$(echo "$frame" | grep -oP ':\d+$' | tr -d ':')
+                if [ -n "$fn_part" ]; then
+                    sl_frame_rows+="<div class='frame-row'>"
+                    sl_frame_rows+="<div class='frame-cnt'>${cnt}×</div>"
+                    sl_frame_rows+="<div class='frame-bar'><div class='frame-bar-fill' style='width:${bw}%'></div></div>"
+                    sl_frame_rows+="<div class='frame-text'><span class='fn'>$(html_e "$fn_part")</span> <span class='fpath'>$(html_e "$path_part")</span><span class='fline'>:${line_part}</span></div>"
+                    sl_frame_rows+="</div>"
+                else
+                    sl_frame_rows+="<div class='frame-row'><div class='frame-cnt'>${cnt}×</div><div class='frame-bar'><div class='frame-bar-fill' style='width:${bw}%'></div></div><div class='frame-text'>$(html_e "$frame")</div></div>"
+                fi
+            done < "$frames_tmp"
+            rm -f "$frames_tmp"
+        fi
+    fi
+
+    # ── MySQL top queries from performance_schema ─
+    # events_statements_summary_by_digest gives us
+    # aggregated stats since last TRUNCATE/restart:
+    # call count, total/avg/max exec time, rows examined.
+    # SCHEMA_NAME = the database context the query ran in.
+    # We also extract the primary table from the digest text.
+    local mysql_query_rows=""
+    local mysql_avail=0
+
+    local mysql_raw
+    mysql_raw=$(mysql --batch --silent -e "
+        SELECT
+            IFNULL(SCHEMA_NAME, '—')                  AS db,
+            DIGEST_TEXT,
+            COUNT_STAR,
+            ROUND(SUM_TIMER_WAIT/1000000000000, 3)   AS total_sec,
+            ROUND(AVG_TIMER_WAIT/1000000000000, 4)   AS avg_sec,
+            ROUND(MAX_TIMER_WAIT/1000000000000, 3)   AS max_sec,
+            SUM_ROWS_EXAMINED,
+            SUM_ROWS_SENT,
+            LAST_SEEN
+        FROM performance_schema.events_statements_summary_by_digest
+        WHERE DIGEST_TEXT IS NOT NULL
+          AND DIGEST_TEXT NOT LIKE '%performance_schema%'
+          AND DIGEST_TEXT NOT LIKE '%SHOW%'
+        ORDER BY SUM_TIMER_WAIT DESC
+        LIMIT 15;" 2>/dev/null)
+
+    if [ -n "$mysql_raw" ]; then
+        mysql_avail=1
+        local max_total_sec=1
+        max_total_sec=$(echo "$mysql_raw" | awk -F'\t' 'NR==1{print ($4+0 > 0) ? $4 : 1}')
+
+        while IFS=$'\t' read -r db digest count total_sec avg_sec max_sec rows_exam rows_sent last_seen; do
+            [ -z "$digest" ] && continue
+
+            # ── Extract primary table from digest text ────────────────
+            # Handles: FROM tbl, JOIN tbl, INTO tbl, UPDATE tbl, TABLE tbl
+            # Strips backticks, aliases, subquery noise
+            local tbl
+            tbl=$(echo "$digest" | awk '{
+                txt = toupper($0)
+                # Try FROM first, then UPDATE, then INTO, then JOIN
+                for (kw in split("FROM UPDATE INTO JOIN", keys, " ")) {
+                    kw = keys[kw]
+                    pos = index(txt, " " kw " ")
+                    if (pos > 0) {
+                        rest = substr($0, pos + length(kw) + 2)
+                        # grab first token, strip backticks/parens
+                        n = split(rest, parts, " ")
+                        t = parts[1]
+                        gsub(/[`()\[\]]/, "", t)
+                        gsub(/,.*/, "", t)
+                        # skip subquery markers
+                        if (t != "(" && t != "SELECT" && length(t) > 0) {
+                            print t; exit
+                        }
+                    }
+                }
+                print "—"
+            }')
+
+            # Simpler fallback using grep+sed if awk extraction returned blank
+            if [ -z "$tbl" ] || [ "$tbl" = "—" ]; then
+                tbl=$(echo "$digest" | grep -ioP '(?<=\bFROM\b\s)\`?[a-zA-Z0-9_]+\`?' | head -1 | tr -d '`')
+                [ -z "$tbl" ] && tbl=$(echo "$digest" | grep -ioP '(?<=\bUPDATE\b\s)\`?[a-zA-Z0-9_]+\`?' | head -1 | tr -d '`')
+                [ -z "$tbl" ] && tbl=$(echo "$digest" | grep -ioP '(?<=\bINTO\b\s)\`?[a-zA-Z0-9_]+\`?' | head -1 | tr -d '`')
+                [ -z "$tbl" ] && tbl="—"
+            fi
+
+            # Truncate long digest text for display
+            local short_digest="$digest"
+            if [ "${#digest}" -gt 110 ]; then
+                short_digest="${digest:0:107}..."
+            fi
+
+            # Colour avg_sec: red >=1s, orange >=0.1s, yellow >=0.01s, green otherwise
+            local avg_col
+            avg_col=$(awk -v a="$avg_sec" 'BEGIN{
+                if(a+0>=1)         print "#ff4757"
+                else if(a+0>=0.1)  print "#ffa502"
+                else if(a+0>=0.01) print "#ffd32a"
+                else               print "#39d98a"
+            }')
+
+            local max_col
+            max_col=$(awk -v m="$max_sec" 'BEGIN{
+                if(m+0>=5)   print "#ff4757"
+                else if(m+0>=1)   print "#ffa502"
+                else print "#39d98a"
+            }')
+
+            mysql_query_rows+="<tr>"
+            # DB + table stacked in first cell
+            mysql_query_rows+="<td style='white-space:nowrap;vertical-align:top;padding-right:8px'>"
+            mysql_query_rows+="<div style='color:#00d4ff;font-weight:600;font-size:11px'>$(html_e "$db")</div>"
+            mysql_query_rows+="<div style='color:#ffd32a;font-size:11px;margin-top:2px'>$(html_e "$tbl")</div>"
+            mysql_query_rows+="</td>"
+            # Query digest
+            mysql_query_rows+="<td class='query-cell'>$(html_e "$short_digest")</td>"
+            mysql_query_rows+="<td style='text-align:right;white-space:nowrap'><span class='pill'>${count}</span></td>"
+            mysql_query_rows+="<td style='text-align:right;white-space:nowrap;color:#ffa502'>${total_sec}s</td>"
+            mysql_query_rows+="<td style='text-align:right;white-space:nowrap;color:${avg_col}'>${avg_sec}s</td>"
+            mysql_query_rows+="<td style='text-align:right;white-space:nowrap;color:${max_col}'>${max_sec}s</td>"
+            mysql_query_rows+="<td style='text-align:right;white-space:nowrap;color:#718096'>${rows_exam}</td>"
+            mysql_query_rows+="<td style='text-align:right;white-space:nowrap;color:#718096'>${rows_sent}</td>"
+            mysql_query_rows+="<td style='color:#4a5568;font-size:10px;white-space:nowrap'>${last_seen}</td>"
+            mysql_query_rows+="</tr>"
+        done <<< "$mysql_raw"
+    fi
+
+    # ── Write HTML ────────────────────────────
+    cat > "$HTML_FILE" << HTMLEOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<title>Server Report — ${HOST_FULL}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0b0e14;--surf:#111620;--bdr:#1e2535;--bdr2:#2a3347;--acc:#00d4ff;--acc2:#ff6b35;--grn:#39d98a;--red:#ff4757;--org:#ffa502;--ylw:#ffd32a;--mut:#4a5568;--txt:#cbd5e0;--dim:#718096;--head:#e2e8f0;--mono:'IBM Plex Mono',monospace;--sans:'Syne',sans-serif}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font-family:var(--mono);font-size:13px;line-height:1.6;min-height:100vh}
+body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(var(--bdr) 1px,transparent 1px),linear-gradient(90deg,var(--bdr) 1px,transparent 1px);background-size:40px 40px;opacity:.25;pointer-events:none;z-index:0}
+.wrap{position:relative;z-index:1;max-width:1280px;margin:0 auto;padding:32px 24px 80px}
+.header{border-bottom:1px solid var(--bdr2);padding-bottom:24px;margin-bottom:32px}
+.header-top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
+.label{font-family:var(--sans);font-size:10px;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--acc);margin-bottom:6px}
+.host{font-family:var(--sans);font-size:36px;font-weight:800;color:var(--head);letter-spacing:-.02em;line-height:1.1}
+.meta{display:flex;flex-direction:column;align-items:flex-end;gap:4px;text-align:right}
+.meta span{color:var(--dim);font-size:12px}.meta strong{color:var(--txt)}
+.badge{display:inline-block;padding:3px 10px;border-radius:3px;font-size:10px;font-weight:600;letter-spacing:.12em;text-transform:uppercase}
+.badge-ok{background:rgba(57,217,138,.12);color:var(--grn);border:1px solid rgba(57,217,138,.25)}
+.badge-warn{background:rgba(255,165,2,.12);color:var(--org);border:1px solid rgba(255,165,2,.25)}
+.badge-alert{background:rgba(255,71,87,.12);color:var(--red);border:1px solid rgba(255,71,87,.25)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px}
+.grid1{display:grid;grid-template-columns:1fr;gap:20px;margin-bottom:20px}
+@media(max-width:780px){.grid2{grid-template-columns:1fr}}
+.panel{background:var(--surf);border:1px solid var(--bdr);border-radius:6px;overflow:hidden}
+.ph{padding:12px 16px;border-bottom:1px solid var(--bdr);display:flex;align-items:center;gap:10px;background:rgba(255,255,255,.02)}
+.pi{font-size:15px;line-height:1}
+.pt{font-family:var(--sans);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--head);flex:1}
+table{width:100%;border-collapse:collapse}
+thead tr{border-bottom:1px solid var(--bdr)}
+th{padding:8px 16px;text-align:left;font-size:10px;font-weight:600;letter-spacing:.15em;text-transform:uppercase;color:var(--mut)}
+td{padding:9px 16px;border-bottom:1px solid rgba(255,255,255,.03);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,.02)}
+.bar-wrap{display:flex;align-items:center;gap:10px}
+.bar-track{flex:1;height:4px;background:var(--bdr);border-radius:2px;overflow:hidden;min-width:50px}
+.bar-fill{height:100%;border-radius:2px}
+.bar-wrap span{font-size:12px;min-width:42px;text-align:right}
+.pill{display:inline-block;background:rgba(0,212,255,.1);color:var(--acc);border:1px solid rgba(0,212,255,.2);border-radius:3px;padding:1px 8px;font-size:11px;font-weight:600;min-width:50px;text-align:center}
+.pill-orange{background:rgba(255,107,53,.1);color:var(--acc2);border-color:rgba(255,107,53,.2)}
+.pill-green{background:rgba(57,217,138,.1);color:var(--grn);border-color:rgba(57,217,138,.2)}
+.pill-red{background:rgba(255,71,87,.1);color:var(--red);border-color:rgba(255,71,87,.2)}
+.url-cell{font-size:11px;color:var(--acc);word-break:break-all;max-width:280px}
+.ip-cell{color:var(--ylw);font-family:var(--mono);font-size:12px}
+.dim{color:var(--dim);font-size:11px}
+.empty{padding:20px 16px;color:var(--mut);font-size:12px;text-align:center}
+.wl-status{padding:16px;display:flex;align-items:center;gap:14px}
+.dot{width:13px;height:13px;border-radius:50%;flex-shrink:0}
+.dot.ok{background:var(--grn);box-shadow:0 0 8px var(--grn)}
+.dot.alert{background:var(--red);box-shadow:0 0 8px var(--red);animation:pulse 1.2s ease-in-out infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 6px var(--red)}50%{box-shadow:0 0 20px var(--red)}}
+.wl-label{font-family:var(--sans);font-weight:700;font-size:14px}
+.wl-count{margin-left:auto;font-size:28px;font-weight:800;font-family:var(--sans);color:var(--red)}
+.sl-meta{padding:14px 16px 0}
+.sl-meta table{border:none}
+.sl-meta td{border:none;padding:4px 12px 4px 0;font-size:12px}
+.sl-meta td:first-child{color:var(--dim);width:100px}
+.section-lbl{font-family:var(--sans);font-size:10px;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--mut);padding:16px 16px 8px}
+.frame-list{padding:8px 0}
+.frame-row{display:flex;align-items:center;gap:0;padding:5px 16px;border-bottom:1px solid rgba(255,255,255,.03);transition:background .15s}
+.frame-row:last-child{border-bottom:none}
+.frame-row:hover{background:rgba(255,255,255,.025)}
+.frame-cnt{flex-shrink:0;width:44px;font-size:11px;font-weight:600;color:var(--acc2);text-align:right;margin-right:12px}
+.frame-bar{flex-shrink:0;width:72px;height:3px;background:var(--bdr);border-radius:2px;margin-right:14px;overflow:hidden}
+.frame-bar-fill{height:100%;background:linear-gradient(90deg,var(--acc2),var(--acc));border-radius:2px}
+.frame-text{flex:1;font-size:11px;word-break:break-all}
+.fn{color:var(--acc);font-weight:600}
+.fpath{color:var(--dim)}
+.fline{color:var(--org)}
+.history-bar{background:var(--surf);border:1px solid var(--bdr);border-radius:6px;padding:14px 18px;margin-bottom:20px;display:flex;align-items:center;gap:12px;font-size:12px;color:var(--dim)}
+.history-bar a{color:var(--acc);text-decoration:none;margin-left:4px}
+.history-bar a:hover{text-decoration:underline}
+footer{margin-top:48px;padding-top:20px;border-top:1px solid var(--bdr);color:var(--mut);font-size:11px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
+.query-cell{font-size:11px;color:var(--txt);word-break:break-all;max-width:480px;font-family:var(--mono);line-height:1.5}
+.query-cell .kw{color:#c792ea;font-weight:600}
+.mysql-note{padding:8px 16px 12px;font-size:11px;color:var(--dim)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="history-bar">
+  📁 <strong>This report:</strong> <code>${NOW_SLUG}.html</code>
+  &nbsp;·&nbsp; <a href="./">Browse all reports →</a>
+</div>
+
+<div class="header">
+  <div class="header-top">
+    <div>
+      <div class="label">Server Performance Report</div>
+      <div class="host">${HOST_FULL}</div>
+    </div>
+    <div class="meta">
+      <span><strong>${NOW_FULL}</strong></span>
+      <span>Uptime: <strong>${UPTIME_S}</strong></span>
+      <span>Load avg: <strong>${LOAD}</strong></span>
+    </div>
+  </div>
+</div>
+
+<div class="grid2">
+  <div class="panel">
+    <div class="ph"><span class="pi">⚙</span><span class="pt">Top CPU Processes</span></div>
+    <table><thead><tr><th>Process</th><th>CPU %</th></tr></thead><tbody>${cpu_rows}</tbody></table>
+  </div>
+  <div class="panel">
+    <div class="ph"><span class="pi">◈</span><span class="pt">Top Memory Processes</span></div>
+    <table><thead><tr><th>Process</th><th>MEM %</th></tr></thead><tbody>${mem_rows}</tbody></table>
+  </div>
+</div>
+
+<div class="grid2">
+  <div class="panel">
+    <div class="ph"><span class="pi">↗</span><span class="pt">Top URLs by Hit Count</span><span class="badge badge-warn">All-time</span></div>
+    <table><thead><tr><th>Hits</th><th>Domain</th><th>URL</th></tr></thead><tbody>${url_rows}</tbody></table>
+  </div>
+  <div class="panel">
+    <div class="ph"><span class="pi">⬡</span><span class="pt">Top IPs Hitting Server</span><span class="badge badge-warn">All-time</span></div>
+    <table><thead><tr><th>Hits</th><th>IP Address</th><th>Volume</th></tr></thead><tbody>${ip_rows}</tbody></table>
+  </div>
+</div>
+
+<div class="grid2">
+  <div class="panel">
+    <div class="ph"><span class="pi">◉</span><span class="pt">Top URLs — Live Window</span><span class="badge badge-ok">This minute</span></div>
+    <table><thead><tr><th>Hits</th><th>Domain</th><th>IP</th><th>URL</th></tr></thead><tbody>${live_url_rows}</tbody></table>
+  </div>
+  <div class="panel">
+    <div class="ph"><span class="pi">⬡</span><span class="pt">Top 3 IPs — Live Window</span><span class="badge badge-ok">This minute</span></div>
+    <table><thead><tr><th>Hits</th><th>Domain</th><th>IP</th><th>Volume</th></tr></thead><tbody>${live_ip_rows}</tbody></table>
+  </div>
+</div>
+
+<div class="grid1">
+  <div class="panel">
+    <div class="ph"><span class="pi">🔐</span><span class="pt">WP-Login.php Activity</span>
+      $([ "$wl_total" -gt 0 ] && echo "<span class='badge badge-alert'>⚠ ${wl_total} hits</span>" || echo "<span class='badge badge-ok'>Clean</span>")
+    </div>
+    <div class="wl-status">
+      <div class="dot ${wl_dot_class}"></div>
+      <div>
+        <div class="wl-label" style="color:$([ "$wl_total" -gt 0 ] && echo 'var(--red)' || echo 'var(--grn)')">${wl_status_text}</div>
+        $([ "$wl_total" -gt 0 ] && echo "<div style='font-size:11px;color:var(--dim);margin-top:3px'>Total hits in access logs</div>")
+      </div>
+      $([ "$wl_total" -gt 0 ] && echo "<div class='wl-count'>${wl_total}</div>")
+    </div>
+    $([ -n "$wl_ip_rows" ] && echo "<div class='section-lbl'>Top offending IPs</div><table><thead><tr><th>Hits</th><th>IP Address</th></tr></thead><tbody>${wl_ip_rows}</tbody></table>")
+  </div>
+</div>
+
+<div class="grid1">
+  <div class="panel">
+    <div class="ph"><span class="pi">🐢</span><span class="pt">PHP Slowlog — Top Offending Plugin</span>
+      $([ -n "$sl_plugin" ] && echo "<span class='badge badge-warn'>${sl_count} slow entries</span>")
+    </div>
+    $(if [ -n "$sl_plugin" ]; then
+        echo "<div class='sl-meta'><table><tbody>"
+        echo "<tr><td>Plugin</td><td style='color:var(--acc);font-weight:600'>$(html_e "$sl_plugin")</td></tr>"
+        echo "<tr><td>Domain</td><td>$(html_e "$sl_domain")</td></tr>"
+        echo "<tr><td>Slow entries</td><td style='color:var(--org);font-weight:600'>${sl_count}</td></tr>"
+        echo "</tbody></table></div>"
+        if [ -n "$sl_frame_rows" ]; then
+            echo "<div class='section-lbl'>Most frequent call stack frames</div>"
+            echo "<div class='frame-list'>${sl_frame_rows}</div>"
+        fi
+    else
+        echo "<div class='empty'>No slowlog data — slowlog not configured or no slow entries recorded</div>"
+    fi)
+  </div>
+</div>
+
+<div class="grid1">
+  <div class="panel">
+    <div class="ph"><span class="pi">🗄</span><span class="pt">MySQL — Top Queries by Total Execution Time</span>
+      $([ "$mysql_avail" -eq 1 ] && echo "<span class='badge badge-warn'>performance_schema</span>" || echo "<span class='badge badge-alert'>unavailable</span>")
+    </div>
+    $(if [ "$mysql_avail" -eq 1 ] && [ -n "$mysql_query_rows" ]; then
+        echo "<div class='mysql-note'>Aggregated since last server restart or <code>TRUNCATE performance_schema.events_statements_summary_by_digest</code>. Sorted by total cumulative execution time.</div>"
+        echo "<div style='overflow-x:auto'>"
+        echo "<table>"
+        echo "<thead><tr>"
+        echo "<th>DB / Table</th>"
+        echo "<th>Query Digest</th>"
+        echo "<th style='text-align:right'>Calls</th>"
+        echo "<th style='text-align:right'>Total time</th>"
+        echo "<th style='text-align:right'>Avg time</th>"
+        echo "<th style='text-align:right'>Max time</th>"
+        echo "<th style='text-align:right'>Rows exam.</th>"
+        echo "<th style='text-align:right'>Rows sent</th>"
+        echo "<th>Last seen</th>"
+        echo "</tr></thead>"
+        echo "<tbody>${mysql_query_rows}</tbody>"
+        echo "</table></div>"
+    else
+        echo "<div class='empty'>$([ "$mysql_avail" -eq 0 ] && echo 'MySQL not accessible or performance_schema not enabled' || echo 'No query data available')</div>"
+    fi)
+  </div>
+</div>
+
+<footer>
+  <span>Generated by Server Monitor Dashboard · ${HOST_FULL}</span>
+  <span>${NOW_FULL}</span>
+</footer>
+</div>
+</body>
+</html>
+HTMLEOF
+
+    echo "  ✔  HTML report written: $HTML_FILE"
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────────"
+    echo "  │  📄 This report  : ${REPORT_URL}"
+    echo "  │  🔗 Latest (always): ${LATEST_URL}"
+    echo "  │  📁 All reports  : ${INDEX_URL}"
+    echo "  └─────────────────────────────────────────────────────"
+    echo ""
+
+    # ── Update report.html in web root to point to latest ────────────
+    # Use a meta-refresh redirect so /report.html always shows newest
+    local REL_PATH
+    if [ -n "$REPORT_SUBDIR" ]; then
+        REL_PATH="${REPORT_SUBDIR}/${NOW_SLUG}.html"
+    else
+        REL_PATH="${NOW_SLUG}.html"
+    fi
+
+    cat > "${REPORT_WEBROOT}/report.html" << REDIREOF
+<!DOCTYPE html>
+<html><head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="0;url=${REL_PATH}">
+<title>Redirecting to latest report...</title>
+</head><body>
+<p>Redirecting to <a href="${REL_PATH}">latest report</a>...</p>
+</body></html>
+REDIREOF
+    echo "  ✔  Latest redirect  : ${LATEST_URL}"
+
+    # ── Generate reports index page ───────────────────────────────────
+    {
+        echo '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+        echo '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        echo "<title>Reports — ${HOST_FULL}</title>"
+        echo '<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Syne:wght@700;800&display=swap" rel="stylesheet">'
+        echo '<style>body{background:#0b0e14;color:#cbd5e0;font-family:"IBM Plex Mono",monospace;padding:40px 24px;max-width:800px;margin:0 auto}h1{font-family:"Syne",sans-serif;font-size:28px;font-weight:800;color:#e2e8f0;margin-bottom:8px}p{color:#718096;font-size:12px;margin-bottom:32px}.report-list{list-style:none}.report-list li{border-bottom:1px solid #1e2535;padding:12px 0;display:flex;align-items:center;gap:12px}.report-list li:last-child{border-bottom:none}.report-list a{color:#00d4ff;text-decoration:none;font-size:13px}.report-list a:hover{text-decoration:underline}.ts{color:#4a5568;font-size:11px;margin-left:auto}.latest{background:rgba(0,212,255,.06);padding:12px 14px;border-radius:4px;border:1px solid rgba(0,212,255,.15)}</style>'
+        echo '</head><body>'
+        echo "<h1>${HOST_FULL}</h1>"
+        echo "<p>Server performance reports · <a href='../report.html' style='color:#00d4ff'>latest report →</a></p>"
+        echo '<ul class="report-list">'
+        local first=1
+        for f in $(ls -t "$PUB_DIR"/*.html 2>/dev/null); do
+            local fname=$(basename "$f")
+            local fdate=$(echo "$fname" | sed 's/_/ /;s/-/:/g;s/\.html//')
+            if [ "$first" -eq 1 ]; then
+                echo "<li class='latest'>🟢 <a href='${fname}'>${fname}</a><span class='ts'>Latest</span></li>"
+                first=0
+            else
+                echo "<li>📄 <a href='${fname}'>${fname}</a><span class='ts'>${fdate}</span></li>"
+            fi
+        done
+        echo '</ul></body></html>'
+    } > "${PUB_DIR}/index.html"
+    echo "  ✔  Report index     : ${INDEX_URL}"
+
+    # ── Prune old reports (keep last 30) ──────────────────────────────
+    local old_reports
+    old_reports=$(ls -t "$PUB_DIR"/*.html 2>/dev/null | grep -v "index.html" | tail -n +31)
+    if [ -n "$old_reports" ]; then
+        echo "$old_reports" | xargs rm -f
+        echo "  ✔  Pruned old reports (kept latest 30)"
+    fi
+
+    # ── Optional: also POST JSON to remote endpoint ───────────────────
+    if [ -n "$REPORT_ENDPOINT" ]; then
+        local JSON_FILE="/tmp/monitor_report_${NOW_SLUG}.json"
+        # Build minimal JSON for remote ingest
+        cat > "$JSON_FILE" << JSONEOF
+{"meta":{"generated":"$(json_str "$NOW_FULL")","host":"$(json_str "$HOST_FULL")","uptime":"$(json_str "$UPTIME_S")","load":"$(json_str "$LOAD")"}}
+JSONEOF
+        echo "  Sending to $REPORT_ENDPOINT ..."
+        http_code=$(curl -s -o /tmp/report_resp.txt -w "%{http_code}" \
+            -X POST -H "Content-Type: application/json" \
+            -H "X-Report-Token: ${REPORT_TOKEN}" \
+            --data-binary "@${JSON_FILE}" "$REPORT_ENDPOINT" 2>/dev/null)
+        [ "$http_code" = "200" ] && echo "  ✔  Remote: $(cat /tmp/report_resp.txt)" || echo "  ✘  Remote send failed (HTTP $http_code)"
+        rm -f "$JSON_FILE" /tmp/report_resp.txt
+    fi
+}
+
+# Trap Ctrl+C — print terminal report then write HTML to web root
 trap '
     echo ""
     echo "  Generating exit report..."
     echo ""
     generate_report
+    echo ""
+    echo "  Writing HTML report to web root..."
+    echo ""
+    generate_html_report
     rm -f "$FRAME"
     exit 0
 ' INT
