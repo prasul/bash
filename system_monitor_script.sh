@@ -730,7 +730,7 @@ generate_html_report() {
 <style>
 :root{
   --bg-dark:#FFF;--bg-card:#e7f6fb;--accent-blue:#1C95E1;
-  --text-main:#0D1117;--text-muted:#8B949E;--border-color:#30363D;
+  --text-main:#0D1117;--text-muted:#EEFFFF;--border-color:#30363D;
   --success-green:#2EA043;
   /* internal aliases kept for compat */
   --bg:var(--bg-dark);--surf:var(--bg-card);--bdr:var(--border-color);--bdr2:#30363D;
@@ -757,15 +757,15 @@ body{background:var(--bg-dark);color:var(--text-main);font-family:'Poppins','Seg
 .grid1{display:grid;grid-template-columns:1fr;gap:20px;margin-bottom:20px}
 @media(max-width:780px){.grid2{grid-template-columns:1fr}}
 .panel{background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;overflow:hidden;margin-bottom:0}
-.ph{padding:12px 16px;border-bottom:1px solid var(--border-color);display:flex;align-items:center;gap:10px;background:#b5c8cf}
+.ph{padding:12px 16px;border-bottom:1px solid var(--border-color);display:flex;align-items:center;gap:10px;background:#4F6780}
 .pi{font-size:15px;line-height:1}
 .pt{font-size:1.2rem;color:var(--accent-blue);flex:1;font-weight:600;margin:0}
 table{width:100%;border-collapse:separate;border-spacing:0;background:var(--bg-card)}
 thead tr{border-bottom:1px solid var(--border-color)}
-th{padding:15px;text-align:left;font-size:11px;font-weight:600;color:var(--accent-blue);background:#b5c8cf;border-bottom:1px solid var(--border-color)}
+th{padding:15px;text-align:left;font-size:11px;font-weight:600;color:var(--accent-blue);background:#4F6780;border-bottom:1px solid var(--border-color)}
 td{padding:12px 15px;border-bottom:1px solid var(--border-color);color:var(--text-muted);vertical-align:middle}
 tr:last-child td{border-bottom:none}
-tr:hover td{background:#1c2128;color:var(--text-main)}
+tr:hover td{background:#E8F0F5;color:var(--text-main)}
 .bar-wrap{display:flex;align-items:center;gap:10px}
 .bar-track{flex:1;height:4px;background:var(--border-color);border-radius:2px;overflow:hidden;min-width:50px}
 .bar-fill{height:100%;border-radius:2px}
@@ -793,7 +793,7 @@ tr:hover td{background:#1c2128;color:var(--text-main)}
 .frame-list{padding:8px 0}
 .frame-row{display:flex;align-items:center;gap:0;padding:5px 16px;border-bottom:1px solid var(--border-color);transition:background .15s}
 .frame-row:last-child{border-bottom:none}
-.frame-row:hover{background:#1c2128}
+.frame-row:hover{background:#E8F0F5}
 .frame-cnt{flex-shrink:0;width:44px;font-size:11px;font-weight:600;color:#f0883e;text-align:right;margin-right:12px}
 .frame-bar{flex-shrink:0;width:72px;height:3px;background:var(--border-color);border-radius:2px;margin-right:14px;overflow:hidden}
 .frame-bar-fill{height:100%;background:linear-gradient(90deg,#f0883e,var(--accent-blue));border-radius:2px}
