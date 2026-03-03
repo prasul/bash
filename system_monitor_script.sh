@@ -730,7 +730,7 @@ generate_html_report() {
 <style>
 :root{
   --bg-dark:#FFF;--bg-card:#e7f6fb;--accent-blue:#1C95E1;
-  --text-main:#0D1117;--text-muted:#EEFFFF;--border-color:#30363D;
+  --text-main:#0D1117;--text-muted:#30363D;--border-color:#30363D;
   --success-green:#2EA043;
   /* internal aliases kept for compat */
   --bg:var(--bg-dark);--surf:var(--bg-card);--bdr:var(--border-color);--bdr2:#30363D;
