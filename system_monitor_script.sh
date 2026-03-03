@@ -729,8 +729,8 @@ generate_html_report() {
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bg-dark:#0D1117;--bg-card:#161B22;--accent-blue:#1C95E1;
-  --text-main:#FFFFFF;--text-muted:#8B949E;--border-color:#30363D;
+  --bg-dark:#FFF;--bg-card:#161B22;--accent-blue:#1C95E1;
+  --text-main:#0D1117;--text-muted:#8B949E;--border-color:#30363D;
   --success-green:#2EA043;
   /* internal aliases kept for compat */
   --bg:var(--bg-dark);--surf:var(--bg-card);--bdr:var(--border-color);--bdr2:#30363D;
