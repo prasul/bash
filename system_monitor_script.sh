@@ -729,7 +729,7 @@ generate_html_report() {
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bg-dark:#FFF;--bg-card:#161B22;--accent-blue:#1C95E1;
+  --bg-dark:#FFF;--bg-card:#e7f6fb;--accent-blue:#1C95E1;
   --text-main:#0D1117;--text-muted:#8B949E;--border-color:#30363D;
   --success-green:#2EA043;
   /* internal aliases kept for compat */
@@ -757,12 +757,12 @@ body{background:var(--bg-dark);color:var(--text-main);font-family:'Poppins','Seg
 .grid1{display:grid;grid-template-columns:1fr;gap:20px;margin-bottom:20px}
 @media(max-width:780px){.grid2{grid-template-columns:1fr}}
 .panel{background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;overflow:hidden;margin-bottom:0}
-.ph{padding:12px 16px;border-bottom:1px solid var(--border-color);display:flex;align-items:center;gap:10px;background:#1f242c}
+.ph{padding:12px 16px;border-bottom:1px solid var(--border-color);display:flex;align-items:center;gap:10px;background:#b5c8cf}
 .pi{font-size:15px;line-height:1}
 .pt{font-size:1.2rem;color:var(--accent-blue);flex:1;font-weight:600;margin:0}
 table{width:100%;border-collapse:separate;border-spacing:0;background:var(--bg-card)}
 thead tr{border-bottom:1px solid var(--border-color)}
-th{padding:15px;text-align:left;font-size:11px;font-weight:600;color:var(--accent-blue);background:#1f242c;border-bottom:1px solid var(--border-color)}
+th{padding:15px;text-align:left;font-size:11px;font-weight:600;color:var(--accent-blue);background:#b5c8cf;border-bottom:1px solid var(--border-color)}
 td{padding:12px 15px;border-bottom:1px solid var(--border-color);color:var(--text-muted);vertical-align:middle}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:#1c2128;color:var(--text-main)}
