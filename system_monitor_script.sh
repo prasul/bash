@@ -1,6 +1,7 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════
 #   SYSTEM MONITOR DASHBOARD — AI Prasul :-P
+#   v2.0 — arithmetic & formatting bugs fixed
 # ═══════════════════════════════════════════════
 
 R="\033[0m"
@@ -30,14 +31,14 @@ SLOWLOG="/var/log/php-fpm/www-slow.log"
 IP_STATE_FILE="/tmp/ip_counts.state"
 touch "$IP_STATE_FILE"
 FILE_CACHE="/tmp/recent_file_changes.cache"
-FILE_SCAN_TS="/tmp/last_file_scan.ts"        # persists scan timestamp across subshell boundaries
+FILE_SCAN_TS="/tmp/last_file_scan.ts"
 [ -f "$FILE_SCAN_TS" ] || echo 0 > "$FILE_SCAN_TS"
-SCAN_INTERVAL=900  # 900 seconds = 15 minutes
-ERRLOG_STATE="/tmp/nginx_error_counts.state"  # persists per-domain error counts across refreshes
+SCAN_INTERVAL=900
+ERRLOG_STATE="/tmp/nginx_error_counts.state"
 touch "$ERRLOG_STATE"
-MYSQL_QPS_STATE="/tmp/mysql_qps.state"        # tracks query count between refreshes for QPS delta
+MYSQL_QPS_STATE="/tmp/mysql_qps.state"
 touch "$MYSQL_QPS_STATE"
-PHPFPM_STATUS_URL="http://127.0.0.1/status"   # adjust if your fpm status page is on a different path/port
+PHPFPM_STATUS_URL="http://127.0.0.1/status"
 
 # ══════════════════════════════════════════════════════
 #  LAYOUT CONFIG — all column math in one place
@@ -131,16 +132,23 @@ VBAR="${DGRAY}|${R}"
 
 # ── Color a percentage value (integer-safe) ───────
 color_pct() {
-    local val="${1%.*}" hi="${2:-50}" med="${3:-20}"
-    if   [ "${val:-0}" -ge "$hi"  ] 2>/dev/null; then printf "${RED}${BOLD}"
-    elif [ "${val:-0}" -ge "$med" ] 2>/dev/null; then printf "${ORANGE}"
+    local raw="${1:-0}"
+    local hi="${2:-50}" med="${3:-20}"
+    # Strip decimal part safely
+    local val
+    val=$(echo "$raw" | tr -d '[:space:]' | sed 's/\..*//')
+    [[ "$val" =~ ^-?[0-9]+$ ]] || val=0
+    if   [ "$val" -ge "$hi"  ]; then printf "${RED}${BOLD}"
+    elif [ "$val" -ge "$med" ]; then printf "${ORANGE}"
     else printf "${GREEN_S}"
     fi
 }
 
 # ══════════════════════════════════════════════════
 # render_two_cols FILE_LEFT FILE_RIGHT
-#   Merges two files side-by-side, ANSI-aware padding
+#   Merges two files side-by-side, ANSI-aware padding.
+#   FIX: broadened ANSI strip regex to cover all
+#        escape sequences, not just SGR 'm' ones.
 # ══════════════════════════════════════════════════
 render_two_cols() {
     local left="$1" right="$2"
@@ -149,7 +157,7 @@ render_two_cols() {
     awk -v col="$col_w" '
     function strip(s,    r) {
         r = s
-        while (match(r, /\033\[[0-9;]*m/)) {
+        while (match(r, /\033\[[0-9;]*[A-Za-z]/)) {
             r = substr(r,1,RSTART-1) substr(r,RSTART+RLENGTH)
         }
         return r
@@ -175,10 +183,7 @@ render_two_cols() {
 }
 
 # ════════════════════════════════════════════════
-#  EXIT REPORT — triggered on Ctrl+C (SIGINT)
-#  Collects live data at exit time and writes a
-#  clean plain-text report to /tmp/monitor_report_TIMESTAMP.txt
-#  then prints it to the terminal.
+#  EXIT REPORT
 # ════════════════════════════════════════════════
 generate_report() {
     local RPT="/tmp/monitor_report_$(date '+%Y%m%d_%H%M%S').txt"
@@ -197,7 +202,6 @@ generate_report() {
     echo "════════════════════════════════════════════════════════════════"
     echo ""
 
-    # ── 1. TOP CPU PROCESSES ─────────────────────────────────────────
     echo "┌─────────────────────────────────────────────────────────────"
     echo "│  TOP CPU-CONSUMING PROCESSES"
     echo "├─────────────────────────────────────────────────────────────"
@@ -206,7 +210,6 @@ generate_report() {
     echo "└─────────────────────────────────────────────────────────────"
     echo ""
 
-    # ── 2. TOP MEMORY PROCESSES ──────────────────────────────────────
     echo "┌─────────────────────────────────────────────────────────────"
     echo "│  TOP MEMORY-CONSUMING PROCESSES"
     echo "├─────────────────────────────────────────────────────────────"
@@ -215,7 +218,6 @@ generate_report() {
     echo "└─────────────────────────────────────────────────────────────"
     echo ""
 
-    # ── 3. TOP URLS (all-time from access logs) ──────────────────────
     echo "┌─────────────────────────────────────────────────────────────"
     echo "│  TOP URLs BY HIT COUNT  (from access logs)"
     echo "├─────────────────────────────────────────────────────────────"
@@ -230,17 +232,16 @@ generate_report() {
     echo "└─────────────────────────────────────────────────────────────"
     echo ""
 
-    # ── 4. TOP IPs (all-time from access logs) ────────────────────────
     echo "┌─────────────────────────────────────────────────────────────"
     echo "│  TOP IPs HITTING THE SERVER  (from access logs)"
     echo "├─────────────────────────────────────────────────────────────"
-    awk '{print $1}' $ACCESSLOG_PATH 2>/dev/null | \
-        sort | uniq -c | sort -nr | head -10 | \
+    for log in $ACCESSLOG_PATH; do
+        [ -f "$log" ] && awk '{print $1}' "$log"
+    done 2>/dev/null | sort | uniq -c | sort -nr | head -10 | \
         awk '{printf "│  %-8s  %s\n", $1, $2}'
     echo "└─────────────────────────────────────────────────────────────"
     echo ""
 
-    # ── 5. LIVE URL HITS (current minute window) ──────────────────────
     echo "┌─────────────────────────────────────────────────────────────"
     echo "│  TOP URLs THIS MINUTE  (live window)"
     echo "├─────────────────────────────────────────────────────────────"
@@ -262,7 +263,6 @@ generate_report() {
     echo "└─────────────────────────────────────────────────────────────"
     echo ""
 
-    # ── 6. TOP 3 IPs IN LIVE WINDOW ───────────────────────────────────
     echo "┌─────────────────────────────────────────────────────────────"
     echo "│  TOP 3 IPs THIS MINUTE  (live window)"
     echo "├─────────────────────────────────────────────────────────────"
@@ -283,12 +283,10 @@ generate_report() {
     echo "└─────────────────────────────────────────────────────────────"
     echo ""
 
-    # ── 7. PHP SLOWLOG — TOP PLUGIN + MOST FREQUENT STACK FRAMES ────────
     echo "┌─────────────────────────────────────────────────────────────"
     echo "│  PHP SLOWLOG — TOP OFFENDING PLUGIN + MOST COMMON CALL STACK"
     echo "├─────────────────────────────────────────────────────────────"
     if [ -f "$SLOWLOG" ]; then
-        # Find the single most-frequent plugin
         TOP_PLUGIN=$(grep "wp-content/plugins/" "$SLOWLOG" | \
             sed -rn 's/.*\/plugins\/([^/ ]+).*/\1/p' | \
             sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
@@ -304,51 +302,24 @@ generate_report() {
             printf "│  Domain      : %s\n"  "${TOP_DOM:-unknown}"
             printf "│  Slow entries: %s\n"  "$TOP_COUNT"
             echo "│"
-            echo "│  Most frequently occurring stack frames"
-            echo "│  (ranked by how often each frame appears across all slow entries):"
+            echo "│  Most frequently occurring stack frames:"
             echo "│  ──────────────────────────────────────────────────────────────"
 
-            # Two-pass approach:
-            # Pass 1 — collect all stack frame lines from the ENTIRE slowlog
-            #           that belong to entries mentioning this plugin.
-            #           We do this by reading the file once in awk, tracking
-            #           which entries contain the plugin, then emitting their frames.
-            # Pass 2 — strip hex address, shorten paths, count+rank by frequency.
-
             awk -v plugin="$TOP_PLUGIN" '
-            BEGIN { entry_count = 0; frame_count = 0 }
-
-            # New entry starts with "# Time:"
+            BEGIN { has_plugin = 0; nframes = 0 }
             /^# Time:/ {
-                # Flush previous entry if it contained the plugin
-                if (has_plugin) {
-                    for (i = 0; i < nframes; i++)
-                        print frames[i]
-                }
-                has_plugin = 0
-                nframes = 0
-                next
+                if (has_plugin) { for (i = 0; i < nframes; i++) print frames[i] }
+                has_plugin = 0; nframes = 0; next
             }
-
-            # Stack frame lines start with [0x
             /^\[0x/ {
-                # Strip the hex address token — everything after "] "
                 line = $0
                 sub(/^\[0x[0-9a-fA-F]+\] /, "", line)
-                # Shorten path
                 sub(/\/home\/nginx\/domains\/[^\/]*\/public\//, "", line)
                 frames[nframes++] = line
                 if (line ~ plugin) has_plugin = 1
                 next
             }
-
-            # Any other line (# script_filename, # Wall time, blank) — skip
-            END {
-                # Flush last entry
-                if (has_plugin)
-                    for (i = 0; i < nframes; i++)
-                        print frames[i]
-            }
+            END { if (has_plugin) for (i = 0; i < nframes; i++) print frames[i] }
             ' "$SLOWLOG" | \
             sort | uniq -c | sort -rn | head -20 | \
             while IFS= read -r ranked_line; do
@@ -368,17 +339,21 @@ generate_report() {
     echo "└─────────────────────────────────────────────────────────────"
     echo ""
 
-    # ── 8. WP-LOGIN STATUS ────────────────────────────────────────────
     echo "┌─────────────────────────────────────────────────────────────"
     echo "│  WP-LOGIN.PHP ACTIVITY"
     echo "├─────────────────────────────────────────────────────────────"
-    local wl_total=$(grep "wp-login.php" $ACCESSLOG_PATH 2>/dev/null | wc -l | tr -d '[:space:]')
+    local wl_total=0
+    for log in $ACCESSLOG_PATH; do
+        [ -f "$log" ] && grep -c "wp-login.php" "$log" 2>/dev/null || echo 0
+    done | awk '{s+=$1} END{print s+0}' | read wl_total
     wl_total=$(( ${wl_total:-0} + 0 ))
     if [ "$wl_total" -gt 0 ]; then
         echo "│  ⚠  Total wp-login.php hits in logs: $wl_total"
         echo "│"
         echo "│  Top offending IPs:"
-        grep "wp-login.php" $ACCESSLOG_PATH 2>/dev/null | \
+        for log in $ACCESSLOG_PATH; do
+            [ -f "$log" ] && grep "wp-login.php" "$log"
+        done 2>/dev/null | \
             awk '{print $1}' | sort | uniq -c | sort -nr | head -5 | \
             awk '{printf "│    %-8s  %s\n", $1, $2}'
     else
@@ -398,24 +373,16 @@ generate_report() {
 }
 
 # ════════════════════════════════════════════════
-#  HTML REPORT — writes directly to this server's
-#  web root so hostname/report.html always shows
-#  the latest snapshot taken at Ctrl+C.
-#
-#  Configure these two paths:
+#  HTML REPORT
 # ════════════════════════════════════════════════
 REPORT_WEBROOT="/usr/local/nginx/html"
-REPORT_SUBDIR="reports"    # reports written to /usr/local/nginx/html/reports/
-REPORT_BASE_URL=""          # override auto-detected URL, e.g. "https://14643.bigscoots-wpo.com"
-
-# Optional: also POST JSON to a remote ingest endpoint
-REPORT_ENDPOINT=""          # e.g. https://reports.yoursite.com/ingest.php
+REPORT_SUBDIR="reports"
+REPORT_BASE_URL=""
+REPORT_ENDPOINT=""
 REPORT_TOKEN="changeme123"
 
-# ── Helper: escape for HTML output ───────────
 html_e() { printf '%s' "$1" | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g;s/"/\&quot;/g'; }
 
-# ── Helper: escape a string for JSON ─────────
 json_str() {
     printf '%s' "$1" | sed \
         -e 's/\\/\\\\/g' \
@@ -433,25 +400,18 @@ generate_html_report() {
     local UPTIME_S=$(uptime -p 2>/dev/null | sed 's/up //')
     local CUR_MIN=$(date "+%d/%b/%Y:%H:%M")
 
-    # ── Resolve output paths ──────────────────
     local PUB_DIR="$REPORT_WEBROOT"
     [ -n "$REPORT_SUBDIR" ] && PUB_DIR="${REPORT_WEBROOT}/${REPORT_SUBDIR}"
 
-    # ── Build the public base URL from hostname ───
-    # Uses HTTPS + the fully-qualified hostname.
-    # Override by setting REPORT_BASE_URL in the config block above.
     local PUBLIC_BASE="${REPORT_BASE_URL:-https://${HOST_FULL}}"
-    # Strip any trailing slash
     PUBLIC_BASE="${PUBLIC_BASE%/}"
 
-    # Full URLs for this report and the latest redirect
     local REPORT_URL="${PUBLIC_BASE}/${REPORT_SUBDIR}/${NOW_SLUG}.html"
     [ -z "$REPORT_SUBDIR" ] && REPORT_URL="${PUBLIC_BASE}/${NOW_SLUG}.html"
     local LATEST_URL="${PUBLIC_BASE}/report.html"
     local INDEX_URL="${PUBLIC_BASE}/${REPORT_SUBDIR}/"
     [ -z "$REPORT_SUBDIR" ] && INDEX_URL="${PUBLIC_BASE}/"
 
-    # Fall back to /tmp if web root doesn't exist
     if [ ! -d "$REPORT_WEBROOT" ]; then
         PUB_DIR="/tmp/monitor_reports"
         echo "  ⚠  Web root not found ($REPORT_WEBROOT), writing to $PUB_DIR"
@@ -462,22 +422,20 @@ generate_html_report() {
     local HTML_FILE="${PUB_DIR}/${NOW_SLUG}.html"
     local LATEST_LINK="${REPORT_WEBROOT}/report.html"
 
-    # ── Collect data ──────────────────────────
-
     # CPU
     local cpu_rows=""
     while read -r proc pct; do
         local bar_w=$(echo "$pct" | awk '{v=int($1*2); if(v>100)v=100; print v}')
-        local col; col=$(awk -v p="$pct" 'BEGIN{if(p+0>=50)print "#f85149"; else if(p+0>=20)print "#f0883e"; else print "#2EA043"}')
-        cpu_rows+="<tr><td>$(html_e "$proc")</td><td><div class='bar-wrap'><div class='bar-track'><div class='bar-fill' style='width:${bar_w}%;background:${col}'></div></div><span style='color:${col}'>${pct}%</span></div></td></tr>"
+        local col; col=$(awk -v p="$pct" 'BEGIN{if(p+0>=50)print "#c92a2a"; else if(p+0>=20)print "#e67700"; else print "#2f9e44"}')
+        cpu_rows+="<tr><td class='mono'>$(html_e "$proc")</td><td><div class='bar-cell'><div class='bar-track'><div class='bar-fill' style='width:${bar_w}%;background:${col}'></div></div><span class='bar-val' style='color:${col}'>${pct}%</span></div></td></tr>"
     done < <(ps -eo comm,%cpu --sort=-%cpu 2>/dev/null | awk 'NR>1&&NR<=8{print $1,$2}')
 
     # Memory
     local mem_rows=""
     while read -r proc pct; do
         local bar_w=$(echo "$pct" | awk '{v=int($1*5); if(v>100)v=100; print v}')
-        local col; col=$(awk -v p="$pct" 'BEGIN{if(p+0>=20)print "#f85149"; else if(p+0>=10)print "#f0883e"; else print "#1C95E1"}')
-        mem_rows+="<tr><td>$(html_e "$proc")</td><td><div class='bar-wrap'><div class='bar-track'><div class='bar-fill' style='width:${bar_w}%;background:${col}'></div></div><span style='color:${col}'>${pct}%</span></div></td></tr>"
+        local col; col=$(awk -v p="$pct" 'BEGIN{if(p+0>=20)print "#c92a2a"; else if(p+0>=10)print "#e67700"; else print "#1c7ed6"}')
+        mem_rows+="<tr><td class='mono'>$(html_e "$proc")</td><td><div class='bar-cell'><div class='bar-track'><div class='bar-fill' style='width:${bar_w}%;background:${col}'></div></div><span class='bar-val' style='color:${col}'>${pct}%</span></div></td></tr>"
     done < <(ps -eo comm,%mem --sort=-%mem 2>/dev/null | awk 'NR>1&&NR<=8{print $1,$2}')
 
     # Top URLs all-time
@@ -489,19 +447,22 @@ generate_html_report() {
     done | sort | uniq -c | sort -nr | head -10 > "$url_tmp"
     local url_rows=""
     while read -r hits dom url; do
-        url_rows+="<tr><td><span class='pill'>${hits}</span></td><td class='dim'>$(html_e "$dom")</td><td class='url-cell'>$(html_e "$url")</td></tr>"
+        url_rows+="<tr><td class='count'>$(html_e "$hits")</td><td class='dim'>$(html_e "$dom")</td><td class='url-cell'>$(html_e "$url")</td></tr>"
     done < "$url_tmp"
     rm -f "$url_tmp"
 
     # Top IPs all-time
-    local max_ip_hits=1
     local ip_tmp=$(mktemp)
-    awk '{print $1}' $ACCESSLOG_PATH 2>/dev/null | sort | uniq -c | sort -nr | head -10 > "$ip_tmp"
+    for log in $ACCESSLOG_PATH; do
+        [ -f "$log" ] && awk '{print $1}' "$log"
+    done 2>/dev/null | sort | uniq -c | sort -nr | head -10 > "$ip_tmp"
+
+    local max_ip_hits=1
     max_ip_hits=$(head -1 "$ip_tmp" | awk '{print $1+0}'); [ "${max_ip_hits:-0}" -eq 0 ] && max_ip_hits=1
     local ip_rows=""
     while read -r hits ip; do
         local bw=$(awk -v h="$hits" -v m="$max_ip_hits" 'BEGIN{printf "%d", h/m*100}')
-        ip_rows+="<tr><td><span class='pill pill-orange'>${hits}</span></td><td class='ip-cell'>$(html_e "$ip")</td><td><div class='bar-track'><div class='bar-fill' style='width:${bw}%;background:#ff6b35'></div></div></td></tr>"
+        ip_rows+="<tr><td class='count'>$(html_e "$hits")</td><td class='ip-cell'>$(html_e "$ip")</td><td><div class='bar-track'><div class='bar-fill' style='width:${bw}%;background:#1c7ed6'></div></div></td></tr>"
     done < "$ip_tmp"
     rm -f "$ip_tmp"
 
@@ -516,7 +477,7 @@ generate_html_report() {
     local live_url_rows=""
     if [ -s "$live_tmp" ]; then
         while read -r hits dom ip url; do
-            live_url_rows+="<tr><td><span class='pill pill-green'>${hits}</span></td><td class='dim'>$(html_e "$dom")</td><td class='ip-cell'>$(html_e "$ip")</td><td class='url-cell'>$(html_e "$url")</td></tr>"
+            live_url_rows+="<tr><td class='count'>$(html_e "$hits")</td><td class='dim'>$(html_e "$dom")</td><td class='ip-cell'>$(html_e "$ip")</td><td class='url-cell'>$(html_e "$url")</td></tr>"
         done < <(sort "$live_tmp" | uniq -c | sort -nr | head -10)
     else
         live_url_rows="<tr><td colspan='4' class='empty'>No traffic in current minute window</td></tr>"
@@ -529,8 +490,9 @@ generate_html_report() {
         max_live=$(awk '{print $2}' "$live_tmp" | sort | uniq -c | sort -nr | head -1 | awk '{print $1+0}')
         [ "${max_live:-0}" -eq 0 ] && max_live=1
         while read -r hits dom ip; do
+            hits=$(( ${hits:-0} + 0 ))
             local bw=$(awk -v h="$hits" -v m="$max_live" 'BEGIN{printf "%d", h/m*100}')
-            live_ip_rows+="<tr><td><span class='pill pill-green'>${hits}</span></td><td class='dim'>$(html_e "$dom")</td><td class='ip-cell'>$(html_e "$ip")</td><td><div class='bar-track'><div class='bar-fill' style='width:${bw}%;background:#39d98a'></div></div></td></tr>"
+            live_ip_rows+="<tr><td class='count'>$(html_e "$hits")</td><td class='dim'>$(html_e "$dom")</td><td class='ip-cell'>$(html_e "$ip")</td><td><div class='bar-track'><div class='bar-fill' style='width:${bw}%;background:#1c7ed6'></div></div></td></tr>"
         done < <(awk '{print $1, $2}' "$live_tmp" | sort | uniq -c | sort -nr | head -3)
     else
         live_ip_rows="<tr><td colspan='4' class='empty'>No traffic in current minute window</td></tr>"
@@ -538,15 +500,20 @@ generate_html_report() {
     rm -f "$live_tmp"
 
     # WP Login
-    local wl_total=$(grep "wp-login.php" $ACCESSLOG_PATH 2>/dev/null | wc -l | tr -d '[:space:]')
-    wl_total=$(( ${wl_total:-0} + 0 ))
+    local wl_total=0
+    for log in $ACCESSLOG_PATH; do
+        [ -f "$log" ] || continue
+        local _wc
+        _wc=$(grep -c "wp-login.php" "$log" 2>/dev/null | tr -d '[:space:]')
+        wl_total=$(( wl_total + ${_wc:-0} ))
+    done
     local wl_status_class="ok" wl_status_text="No wp-login.php hits detected" wl_dot_class="ok"
     [ "$wl_total" -gt 0 ] && { wl_status_class="alert"; wl_dot_class="alert"; wl_status_text="Login page hits detected"; }
     local wl_ip_rows=""
     if [ "$wl_total" -gt 0 ]; then
         while read -r hits ip; do
-            wl_ip_rows+="<tr><td><span class='pill pill-red'>${hits}</span></td><td class='ip-cell'>$(html_e "$ip")</td></tr>"
-        done < <(grep "wp-login.php" $ACCESSLOG_PATH 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -nr | head -5)
+            wl_ip_rows+="<tr><td class='count count-hi'>$(html_e "$hits")</td><td class='ip-cell'>$(html_e "$ip")</td></tr>"
+        done < <(for log in $ACCESSLOG_PATH; do [ -f "$log" ] && grep "wp-login.php" "$log"; done 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -nr | head -5)
     fi
 
     # PHP Slowlog
@@ -556,7 +523,8 @@ generate_html_report() {
             sed -rn 's/.*\/plugins\/([^/ ]+).*/\1/p' | \
             sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
         if [ -n "$sl_plugin" ]; then
-            sl_count=$(grep -c "$sl_plugin" "$SLOWLOG" | tr -d '[:space:]')
+            sl_count=$(grep -c "$sl_plugin" "$SLOWLOG" 2>/dev/null | tr -d '[:space:]')
+            sl_count=$(( ${sl_count:-0} + 0 ))
             sl_domain=$(grep "wp-content/plugins/$sl_plugin" "$SLOWLOG" | \
                 sed -rn 's/.*\/domains\/([^/]+)\/.*/\1/p' | \
                 sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
@@ -586,8 +554,8 @@ generate_html_report() {
             while IFS= read -r ranked_line; do
                 local cnt=$(echo "$ranked_line" | awk '{print $1}')
                 local frame=$(echo "$ranked_line" | cut -d' ' -f2-)
+                cnt=$(( ${cnt:-0} + 0 ))
                 local bw=$(awk -v c="$cnt" -v m="$max_frame" 'BEGIN{printf "%d", c/m*100}')
-                # Split into function / path / line for colouring
                 local fn_part path_part line_part
                 fn_part=$(echo "$frame"  | grep -oP '^[^\s]+\(\)')
                 path_part=$(echo "$frame" | grep -oP '(?<=\(\) ).+(?=:\d+$)')
@@ -606,12 +574,7 @@ generate_html_report() {
         fi
     fi
 
-    # ── MySQL top queries from performance_schema ─
-    # events_statements_summary_by_digest gives us
-    # aggregated stats since last TRUNCATE/restart:
-    # call count, total/avg/max exec time, rows examined.
-    # SCHEMA_NAME = the database context the query ran in.
-    # We also extract the primary table from the digest text.
+    # MySQL top queries
     local mysql_query_rows=""
     local mysql_avail=0
 
@@ -637,29 +600,27 @@ generate_html_report() {
     if [ -n "$mysql_raw" ]; then
         mysql_avail=1
         local max_total_sec=1
-        max_total_sec=$(echo "$mysql_raw" | awk -F'\t' 'NR==1{print ($4+0 > 0) ? $4 : 1}')
+        local _mts
+        _mts=$(echo "$mysql_raw" | awk -F'\t' 'NR==1{v=$4+0; print (v>0)?v:1}')
+        [[ "$_mts" =~ ^[0-9]+(\.[0-9]+)?$ ]] && max_total_sec="$_mts"
 
         while IFS=$'\t' read -r db digest count total_sec avg_sec max_sec rows_exam rows_sent last_seen; do
             [ -z "$digest" ] && continue
 
-            # ── Extract primary table from digest text ────────────────
-            # Handles: FROM tbl, JOIN tbl, INTO tbl, UPDATE tbl, TABLE tbl
-            # Strips backticks, aliases, subquery noise
+
             local tbl
             tbl=$(echo "$digest" | awk '{
                 txt = toupper($0)
-                # Try FROM first, then UPDATE, then INTO, then JOIN
-                for (kw in split("FROM UPDATE INTO JOIN", keys, " ")) {
-                    kw = keys[kw]
+                n = split("FROM UPDATE INTO JOIN", keys, " ")
+                for (kw_i = 1; kw_i <= n; kw_i++) {
+                    kw = keys[kw_i]
                     pos = index(txt, " " kw " ")
                     if (pos > 0) {
                         rest = substr($0, pos + length(kw) + 2)
-                        # grab first token, strip backticks/parens
-                        n = split(rest, parts, " ")
+                        n2 = split(rest, parts, " ")
                         t = parts[1]
                         gsub(/[`()\[\]]/, "", t)
                         gsub(/,.*/, "", t)
-                        # skip subquery markers
                         if (t != "(" && t != "SELECT" && length(t) > 0) {
                             print t; exit
                         }
@@ -668,7 +629,6 @@ generate_html_report() {
                 print "—"
             }')
 
-            # Simpler fallback using grep+sed if awk extraction returned blank
             if [ -z "$tbl" ] || [ "$tbl" = "—" ]; then
                 tbl=$(echo "$digest" | grep -ioP '(?<=\bFROM\b\s)\`?[a-zA-Z0-9_]+\`?' | head -1 | tr -d '`')
                 [ -z "$tbl" ] && tbl=$(echo "$digest" | grep -ioP '(?<=\bUPDATE\b\s)\`?[a-zA-Z0-9_]+\`?' | head -1 | tr -d '`')
@@ -676,270 +636,468 @@ generate_html_report() {
                 [ -z "$tbl" ] && tbl="—"
             fi
 
-            # Truncate long digest text for display
             local short_digest="$digest"
-            if [ "${#digest}" -gt 110 ]; then
-                short_digest="${digest:0:107}..."
-            fi
+            [ "${#digest}" -gt 110 ] && short_digest="${digest:0:107}..."
 
-            # Colour avg_sec: red >=1s, orange >=0.1s, yellow >=0.01s, green otherwise
             local avg_col
             avg_col=$(awk -v a="$avg_sec" 'BEGIN{
-                if(a+0>=1)         print "#f85149"
-                else if(a+0>=0.1)  print "#f0883e"
-                else if(a+0>=0.01) print "#e3b341"
-                else               print "#2EA043"
+                if(a+0>=1)         print "#c92a2a"
+                else if(a+0>=0.1)  print "#e67700"
+                else if(a+0>=0.01) print "#495057"
+                else               print "#2f9e44"
             }')
 
             local max_col
             max_col=$(awk -v m="$max_sec" 'BEGIN{
-                if(m+0>=5)   print "#f85149"
-                else if(m+0>=1)   print "#f0883e"
-                else print "#2EA043"
+                if(m+0>=5)        print "#c92a2a"
+                else if(m+0>=1)   print "#e67700"
+                else              print "#2f9e44"
             }')
 
             mysql_query_rows+="<tr>"
-            # DB + table stacked in first cell
-            mysql_query_rows+="<td style='white-space:nowrap;vertical-align:top;padding-right:8px'>"
-            mysql_query_rows+="<div style='color:var(--accent-blue);font-weight:600;font-size:11px'>$(html_e "$db")</div>"
-            mysql_query_rows+="<div style='color:#e3b341;font-size:11px;margin-top:2px'>$(html_e "$tbl")</div>"
+            mysql_query_rows+="<td class='db-stack'>"
+            mysql_query_rows+="<div class='db-name'>$(html_e "$db")</div>"
+            mysql_query_rows+="<div class='db-table'>$(html_e "$tbl")</div>"
             mysql_query_rows+="</td>"
-            # Query digest
             mysql_query_rows+="<td class='query-cell'>$(html_e "$short_digest")</td>"
-            mysql_query_rows+="<td style='text-align:right;white-space:nowrap'><span class='pill'>${count}</span></td>"
-            mysql_query_rows+="<td style='text-align:right;white-space:nowrap;color:#ffa502'>${total_sec}s</td>"
-            mysql_query_rows+="<td style='text-align:right;white-space:nowrap;color:${avg_col}'>${avg_sec}s</td>"
-            mysql_query_rows+="<td style='text-align:right;white-space:nowrap;color:${max_col}'>${max_sec}s</td>"
-            mysql_query_rows+="<td style='text-align:right;white-space:nowrap;color:#718096'>${rows_exam}</td>"
-            mysql_query_rows+="<td style='text-align:right;white-space:nowrap;color:#718096'>${rows_sent}</td>"
-            mysql_query_rows+="<td style='color:#4a5568;font-size:10px;white-space:nowrap'>${last_seen}</td>"
+            mysql_query_rows+="<td class='t-right t-num'>${count}</td>"
+            mysql_query_rows+="<td class='t-right t-num'>${total_sec}s</td>"
+            mysql_query_rows+="<td class='t-right t-num' style='color:${avg_col}'>${avg_sec}s</td>"
+            mysql_query_rows+="<td class='t-right t-num' style='color:${max_col}'>${max_sec}s</td>"
+            mysql_query_rows+="<td class='t-right t-num'>${rows_exam}</td>"
+            mysql_query_rows+="<td class='t-right t-num'>${rows_sent}</td>"
+            mysql_query_rows+="<td class='dim' style='white-space:nowrap'>${last_seen}</td>"
             mysql_query_rows+="</tr>"
         done <<< "$mysql_raw"
     fi
 
-    # ── Write HTML ────────────────────────────
     cat > "$HTML_FILE" << HTMLEOF
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="X-UA-Compatible" content="IE=edge">
 <title>Server Report — ${HOST_FULL}</title>
-<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-:root{
-  --bg-dark:#FFF;--bg-card:#e7f6fb;--accent-blue:#1C95E1;
-  --text-main:#0D1117;--text-muted:#30363D;--border-color:#30363D;
-  --success-green:#2EA043;
-  /* internal aliases kept for compat */
-  --bg:var(--bg-dark);--surf:var(--bg-card);--bdr:var(--border-color);--bdr2:#30363D;
-  --acc:var(--accent-blue);--acc2:#f0883e;--grn:var(--success-green);
-  --red:#f85149;--org:#f0883e;--ylw:#e3b341;--mut:var(--text-muted);
-  --txt:var(--text-muted);--dim:var(--text-muted);--head:var(--text-main);
-  --mono:'Poppins','Segoe UI',Roboto,Helvetica,Arial,sans-serif;
-  --sans:'Poppins','Segoe UI',Roboto,Helvetica,Arial,sans-serif
+:root {
+  --bg:      #f8f9fa;
+  --surface: #ffffff;
+  --border:  #e2e6ea;
+  --border2: #ced4da;
+  --txt:     #212529;
+  --txt2:    #495057;
+  --muted:   #6c757d;
+  --light:   #f1f3f5;
+  --accent:  #1c7ed6;
+  --green:   #2f9e44;
+  --red:     #c92a2a;
+  --orange:  #e67700;
+  --mono:    'JetBrains Mono', 'Courier New', monospace;
+  --sans:    'Inter', system-ui, sans-serif;
+  --radius:  6px;
+  --shadow:  0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.06);
 }
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg-dark);color:var(--text-main);font-family:'Poppins','Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;line-height:1.6;min-height:100vh;padding:40px 20px}
-.wrap{max-width:1000px;margin:0 auto}
-.header{border-bottom:2px solid var(--accent-blue);padding-bottom:10px;margin-bottom:30px}
-.header-top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
-.label{font-size:10px;font-weight:600;letter-spacing:.2em;text-transform:uppercase;color:var(--text-muted);margin-bottom:6px}
-.host{font-size:1.6rem;font-weight:600;color:var(--text-main);line-height:1.2}
-.meta{display:flex;flex-direction:column;align-items:flex-end;gap:4px;text-align:right}
-.meta span{color:var(--text-muted);font-size:12px}.meta strong{color:var(--text-main)}
-.badge{display:inline-block;padding:3px 10px;border-radius:6px;font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase}
-.badge-ok{background:rgba(46,160,67,.15);color:var(--success-green);border:1px solid rgba(46,160,67,.3)}
-.badge-warn{background:rgba(240,136,62,.15);color:#f0883e;border:1px solid rgba(240,136,62,.3)}
-.badge-alert{background:rgba(248,81,73,.15);color:#f85149;border:1px solid rgba(248,81,73,.3)}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px}
-.grid1{display:grid;grid-template-columns:1fr;gap:20px;margin-bottom:20px}
-@media(max-width:780px){.grid2{grid-template-columns:1fr}}
-.panel{background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;overflow:hidden;margin-bottom:0}
-.ph{padding:12px 16px;border-bottom:1px solid var(--border-color);display:flex;align-items:center;gap:10px;background:#4F6780}
-.pi{font-size:15px;line-height:1}
-.pt{font-size:1.2rem;color:var(--accent-blue);flex:1;font-weight:600;margin:0}
-table{width:100%;border-collapse:separate;border-spacing:0;background:var(--bg-card)}
-thead tr{border-bottom:1px solid var(--border-color)}
-th{padding:15px;text-align:left;font-size:11px;font-weight:600;color:var(--accent-blue);background:#4F6780;border-bottom:1px solid var(--border-color)}
-td{padding:12px 15px;border-bottom:1px solid var(--border-color);color:var(--text-muted);vertical-align:middle}
-tr:last-child td{border-bottom:none}
-tr:hover td{background:#E8F0F5;color:var(--text-main)}
-.bar-wrap{display:flex;align-items:center;gap:10px}
-.bar-track{flex:1;height:4px;background:var(--border-color);border-radius:2px;overflow:hidden;min-width:50px}
-.bar-fill{height:100%;border-radius:2px}
-.bar-wrap span{font-size:12px;min-width:42px;text-align:right}
-.pill{display:inline-block;background:rgba(28,149,225,.12);color:var(--accent-blue);border:1px solid rgba(28,149,225,.25);border-radius:6px;padding:2px 10px;font-size:11px;font-weight:600;min-width:50px;text-align:center}
-.pill-orange{background:rgba(240,136,62,.12);color:#f0883e;border-color:rgba(240,136,62,.25)}
-.pill-green{background:rgba(46,160,67,.12);color:var(--success-green);border-color:rgba(46,160,67,.25)}
-.pill-red{background:rgba(248,81,73,.12);color:#f85149;border-color:rgba(248,81,73,.25)}
-.url-cell{font-size:11px;color:var(--accent-blue);word-break:break-all;max-width:280px}
-.ip-cell{color:var(--text-main);font-size:12px}
-.dim{color:var(--text-muted);font-size:11px}
-.empty{padding:20px 16px;color:var(--text-muted);font-size:12px;text-align:center}
-.wl-status{padding:16px;display:flex;align-items:center;gap:14px}
-.dot{width:13px;height:13px;border-radius:50%;flex-shrink:0}
-.dot.ok{background:var(--success-green);box-shadow:0 0 8px var(--success-green)}
-.dot.alert{background:#f85149;box-shadow:0 0 8px #f85149;animation:pulse 1.2s ease-in-out infinite}
-@keyframes pulse{0%,100%{box-shadow:0 0 6px #f85149}50%{box-shadow:0 0 20px #f85149}}
-.wl-label{font-weight:600;font-size:14px}
-.wl-count{margin-left:auto;font-size:28px;font-weight:600;color:#f85149}
-.sl-meta{padding:14px 16px 0}
-.sl-meta table{border:none;background:transparent}
-.sl-meta td{border:none;padding:4px 12px 4px 0;font-size:12px;background:transparent!important}
-.sl-meta td:first-child{color:var(--text-muted);width:100px}
-.section-lbl{font-size:10px;font-weight:600;letter-spacing:.2em;text-transform:uppercase;color:var(--text-muted);padding:16px 16px 8px}
-.frame-list{padding:8px 0}
-.frame-row{display:flex;align-items:center;gap:0;padding:5px 16px;border-bottom:1px solid var(--border-color);transition:background .15s}
-.frame-row:last-child{border-bottom:none}
-.frame-row:hover{background:#E8F0F5}
-.frame-cnt{flex-shrink:0;width:44px;font-size:11px;font-weight:600;color:#f0883e;text-align:right;margin-right:12px}
-.frame-bar{flex-shrink:0;width:72px;height:3px;background:var(--border-color);border-radius:2px;margin-right:14px;overflow:hidden}
-.frame-bar-fill{height:100%;background:linear-gradient(90deg,#f0883e,var(--accent-blue));border-radius:2px}
-.frame-text{flex:1;font-size:11px;word-break:break-all}
-.fn{color:var(--accent-blue);font-weight:600}
-.fpath{color:var(--text-muted)}
-.fline{color:#f0883e}
-.history-bar{background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;padding:14px 18px;margin-bottom:20px;display:flex;align-items:center;gap:12px;font-size:12px;color:var(--text-muted)}
-.history-bar a{color:var(--accent-blue);text-decoration:none;margin-left:4px}
-.history-bar a:hover{text-decoration:underline}
-footer{text-align:center;margin-top:50px;font-size:0.85rem;color:var(--text-muted);border-top:1px solid var(--border-color);padding-top:20px}
-.query-cell{font-size:11px;color:var(--text-muted);word-break:break-all;max-width:480px;line-height:1.5}
-.query-cell .kw{color:var(--accent-blue);font-weight:600}
-.mysql-note{padding:8px 16px 12px;font-size:11px;color:var(--text-muted)}
-/* Status classes */
-.status-ok{color:var(--success-green);font-weight:bold}
-.status-warn{color:#f0883e;font-weight:bold}
-.status-crit{color:#f85149;font-weight:bold}
-h1{font-weight:600;color:var(--text-main);border-bottom:2px solid var(--accent-blue);padding-bottom:10px;margin-bottom:30px}
-h2{font-size:1.2rem;color:var(--accent-blue);margin-top:30px}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--txt);
+  font-family: var(--sans);
+  font-size: 13.5px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--light);
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  color: var(--txt2);
+}
+
+/* ── Layout ─────────────────────────────────── */
+.wrap { max-width: 1280px; margin: 0 auto; padding: 32px 24px 64px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+.grid1 { display: grid; grid-template-columns: 1fr; gap: 16px; margin-bottom: 16px; }
+@media (max-width: 800px) { .grid2 { grid-template-columns: 1fr; } }
+
+/* ── Report header ───────────────────────────── */
+.report-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 24px;
+  flex-wrap: wrap;
+  padding-bottom: 24px;
+  margin-bottom: 28px;
+  border-bottom: 2px solid var(--border);
+}
+.rh-left .report-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.rh-left .report-host {
+  font-size: 26px;
+  font-weight: 600;
+  color: var(--txt);
+  line-height: 1.2;
+}
+.rh-right {
+  text-align: right;
+  font-size: 12.5px;
+  color: var(--txt2);
+  line-height: 1.7;
+}
+.rh-right strong { color: var(--txt); font-weight: 500; }
+
+/* ── Breadcrumb / nav ────────────────────────── */
+.nav-bar {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 24px;
+  padding: 8px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.nav-bar a { color: var(--accent); }
+
+/* ── Panels ──────────────────────────────────── */
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.panel-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--light);
+}
+.panel-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--txt);
+  letter-spacing: .01em;
+  flex: 1;
+}
+
+/* ── Status badges ───────────────────────────── */
+.badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+}
+.badge-ok     { background: #ebfbee; color: #2f9e44; border-color: #b2f2bb; }
+.badge-warn   { background: #fff9db; color: #e67700; border-color: #ffec99; }
+.badge-alert  { background: #fff5f5; color: #c92a2a; border-color: #ffc9c9; }
+.badge-info   { background: #e7f5ff; color: #1971c2; border-color: #a5d8ff; }
+
+/* ── Tables ──────────────────────────────────── */
+table { width: 100%; border-collapse: collapse; }
+thead tr { border-bottom: 1px solid var(--border); }
+th {
+  padding: 8px 14px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  text-align: left;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  background: var(--light);
+}
+td {
+  padding: 9px 14px;
+  font-size: 13px;
+  color: var(--txt2);
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+tr:last-child td { border-bottom: none; }
+tbody tr:hover td { background: #f8f9fa; }
+
+/* ── Count pill ──────────────────────────────── */
+.count {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  min-width: 42px;
+  text-align: right;
+  color: var(--txt);
+}
+.count-hi  { color: var(--red); }
+.count-med { color: var(--orange); }
+
+/* ── Bar chart ───────────────────────────────── */
+.bar-cell { display: flex; align-items: center; gap: 10px; }
+.bar-track { flex: 1; height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; min-width: 60px; }
+.bar-fill  { height: 100%; border-radius: 3px; }
+.bar-val   { font-size: 12px; font-family: var(--mono); min-width: 40px; text-align: right; color: var(--txt2); }
+
+/* ── Monospace cells ─────────────────────────── */
+.mono     { font-family: var(--mono); font-size: 12px; color: var(--txt); }
+.url-cell { font-family: var(--mono); font-size: 11.5px; color: var(--accent); word-break: break-all; max-width: 320px; }
+.ip-cell  { font-family: var(--mono); font-size: 12px; color: var(--txt); }
+.dim      { color: var(--muted); font-size: 12px; }
+
+/* ── Status indicator ────────────────────────── */
+.status-row { display: flex; align-items: center; gap: 12px; padding: 14px 16px; }
+.status-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.status-dot.ok    { background: var(--green); }
+.status-dot.alert { background: var(--red); }
+.status-label { font-size: 13.5px; font-weight: 500; color: var(--txt); }
+.status-count { margin-left: auto; font-size: 22px; font-weight: 600; font-family: var(--mono); color: var(--red); }
+
+/* ── Key–value meta table ────────────────────── */
+.kv-table { padding: 12px 16px 4px; }
+.kv-table table { border: none; }
+.kv-table td { border: none; padding: 4px 16px 4px 0; font-size: 12.5px; color: var(--txt2); }
+.kv-table td:first-child { color: var(--muted); width: 120px; font-size: 12px; }
+.kv-table td strong { color: var(--txt); font-weight: 500; }
+
+/* ── Section label ───────────────────────────── */
+.section-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 14px 16px 6px;
+}
+
+/* ── Call stack frames ───────────────────────── */
+.frame-list { padding: 4px 0 8px; }
+.frame-row {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 5px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.frame-row:last-child { border-bottom: none; }
+.frame-row:hover { background: var(--light); }
+.frame-cnt  { flex-shrink: 0; width: 40px; font-size: 11.5px; font-family: var(--mono); font-weight: 500; color: var(--muted); text-align: right; margin-right: 12px; }
+.frame-bar  { flex-shrink: 0; width: 64px; height: 3px; background: var(--border); border-radius: 2px; margin-right: 14px; overflow: hidden; }
+.frame-bar-fill { height: 100%; background: var(--orange); border-radius: 2px; }
+.frame-text { flex: 1; font-family: var(--mono); font-size: 11.5px; color: var(--txt2); word-break: break-all; }
+.fn    { color: var(--accent); font-weight: 500; }
+.fpath { color: var(--muted); }
+.fline { color: var(--orange); }
+
+/* ── Empty state ─────────────────────────────── */
+.empty { padding: 20px 16px; font-size: 12.5px; color: var(--muted); text-align: center; }
+
+/* ── MySQL query table ───────────────────────── */
+.query-cell {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--txt2);
+  word-break: break-all;
+  max-width: 480px;
+  line-height: 1.5;
+}
+.db-stack { white-space: nowrap; vertical-align: top; }
+.db-name  { font-size: 12px; font-weight: 500; color: var(--accent); }
+.db-table { font-size: 11px; color: var(--muted); margin-top: 2px; font-family: var(--mono); }
+.mysql-note {
+  padding: 10px 16px;
+  font-size: 12px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+  background: var(--light);
+}
+.t-right { text-align: right; }
+.t-num   { font-family: var(--mono); font-size: 12px; }
+
+/* ── Footer ──────────────────────────────────── */
+.report-footer {
+  margin-top: 48px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
 </style>
 </head>
 <body>
 <div class="wrap">
 
-<div class="history-bar">
-  📁 <strong>This report:</strong> <code>${NOW_SLUG}.html</code>
-  &nbsp;·&nbsp; <a href="./">Browse all reports →</a>
+<div class="nav-bar">
+  <a href="./">All reports</a> &rsaquo; ${NOW_SLUG}.html
+  &nbsp;&nbsp;&middot;&nbsp;&nbsp;
+  <a href="../report.html">Latest report</a>
 </div>
 
-<div class="header">
-  <div class="header-top">
-    <div>
-      <div class="label">Server Performance Report</div>
-      <div class="host">${HOST_FULL}</div>
+<div class="report-header">
+  <div class="rh-left">
+    <div class="report-label">Server Performance Report</div>
+    <div class="report-host">${HOST_FULL}</div>
+  </div>
+  <div class="rh-right">
+    <div><strong>${NOW_FULL}</strong></div>
+    <div>Uptime: <strong>${UPTIME_S}</strong></div>
+    <div>Load average: <strong>${LOAD}</strong></div>
+  </div>
+</div>
+
+<div class="grid2">
+  <div class="panel">
+    <div class="panel-header"><span class="panel-title">CPU Usage — Top Processes</span></div>
+    <table>
+      <thead><tr><th>Process</th><th>CPU %</th></tr></thead>
+      <tbody>${cpu_rows}</tbody>
+    </table>
+  </div>
+  <div class="panel">
+    <div class="panel-header"><span class="panel-title">Memory Usage — Top Processes</span></div>
+    <table>
+      <thead><tr><th>Process</th><th>Memory %</th></tr></thead>
+      <tbody>${mem_rows}</tbody>
+    </table>
+  </div>
+</div>
+
+<div class="grid2">
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">Top URLs by Hit Count</span>
+      <span class="badge badge-info">All-time</span>
     </div>
-    <div class="meta">
-      <span><strong>${NOW_FULL}</strong></span>
-      <span>Uptime: <strong>${UPTIME_S}</strong></span>
-      <span>Load avg: <strong>${LOAD}</strong></span>
+    <table>
+      <thead><tr><th>Hits</th><th>Domain</th><th>URL</th></tr></thead>
+      <tbody>${url_rows}</tbody>
+    </table>
+  </div>
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">Top IP Addresses by Hit Count</span>
+      <span class="badge badge-info">All-time</span>
     </div>
+    <table>
+      <thead><tr><th>Hits</th><th>IP Address</th><th>Share</th></tr></thead>
+      <tbody>${ip_rows}</tbody>
+    </table>
   </div>
 </div>
 
 <div class="grid2">
   <div class="panel">
-    <div class="ph"><span class="pi">⚙</span><span class="pt">Top CPU Processes</span></div>
-    <table><thead><tr><th>Process</th><th>CPU %</th></tr></thead><tbody>${cpu_rows}</tbody></table>
+    <div class="panel-header">
+      <span class="panel-title">Top URLs — Current Minute</span>
+      <span class="badge badge-ok">Live</span>
+    </div>
+    <table>
+      <thead><tr><th>Hits</th><th>Domain</th><th>IP</th><th>URL</th></tr></thead>
+      <tbody>${live_url_rows}</tbody>
+    </table>
   </div>
   <div class="panel">
-    <div class="ph"><span class="pi">◈</span><span class="pt">Top Memory Processes</span></div>
-    <table><thead><tr><th>Process</th><th>MEM %</th></tr></thead><tbody>${mem_rows}</tbody></table>
-  </div>
-</div>
-
-<div class="grid2">
-  <div class="panel">
-    <div class="ph"><span class="pi">↗</span><span class="pt">Top URLs by Hit Count</span><span class="badge badge-warn">All-time</span></div>
-    <table><thead><tr><th>Hits</th><th>Domain</th><th>URL</th></tr></thead><tbody>${url_rows}</tbody></table>
-  </div>
-  <div class="panel">
-    <div class="ph"><span class="pi">⬡</span><span class="pt">Top IPs Hitting Server</span><span class="badge badge-warn">All-time</span></div>
-    <table><thead><tr><th>Hits</th><th>IP Address</th><th>Volume</th></tr></thead><tbody>${ip_rows}</tbody></table>
-  </div>
-</div>
-
-<div class="grid2">
-  <div class="panel">
-    <div class="ph"><span class="pi">◉</span><span class="pt">Top URLs — Live Window</span><span class="badge badge-ok">This minute</span></div>
-    <table><thead><tr><th>Hits</th><th>Domain</th><th>IP</th><th>URL</th></tr></thead><tbody>${live_url_rows}</tbody></table>
-  </div>
-  <div class="panel">
-    <div class="ph"><span class="pi">⬡</span><span class="pt">Top 3 IPs — Live Window</span><span class="badge badge-ok">This minute</span></div>
-    <table><thead><tr><th>Hits</th><th>Domain</th><th>IP</th><th>Volume</th></tr></thead><tbody>${live_ip_rows}</tbody></table>
+    <div class="panel-header">
+      <span class="panel-title">Top IP Addresses — Current Minute</span>
+      <span class="badge badge-ok">Live</span>
+    </div>
+    <table>
+      <thead><tr><th>Hits</th><th>Domain</th><th>IP</th><th>Share</th></tr></thead>
+      <tbody>${live_ip_rows}</tbody>
+    </table>
   </div>
 </div>
 
 <div class="grid1">
   <div class="panel">
-    <div class="ph"><span class="pi">🔐</span><span class="pt">WP-Login.php Activity</span>
-      $([ "$wl_total" -gt 0 ] && echo "<span class='badge badge-alert'>⚠ ${wl_total} hits</span>" || echo "<span class='badge badge-ok'>Clean</span>")
+    <div class="panel-header">
+      <span class="panel-title">WP-Login.php Activity</span>
+      $([ "$wl_total" -gt 0 ] && echo "<span class='badge badge-alert'>${wl_total} hits detected</span>" || echo "<span class='badge badge-ok'>No activity</span>")
     </div>
-    <div class="wl-status">
-      <div class="dot ${wl_dot_class}"></div>
+    <div class="status-row">
+      <div class="status-dot ${wl_dot_class}"></div>
       <div>
-        <div class="wl-label" style="color:$([ "$wl_total" -gt 0 ] && echo 'var(--red)' || echo 'var(--grn)')">${wl_status_text}</div>
-        $([ "$wl_total" -gt 0 ] && echo "<div style='font-size:11px;color:var(--dim);margin-top:3px'>Total hits in access logs</div>")
+        <div class="status-label">${wl_status_text}</div>
+        $([ "$wl_total" -gt 0 ] && echo "<div class='dim' style='margin-top:2px'>Total hits recorded in access logs</div>")
       </div>
-      $([ "$wl_total" -gt 0 ] && echo "<div class='wl-count'>${wl_total}</div>")
+      $([ "$wl_total" -gt 0 ] && echo "<div class='status-count'>${wl_total}</div>")
     </div>
-    $([ -n "$wl_ip_rows" ] && echo "<div class='section-lbl'>Top offending IPs</div><table><thead><tr><th>Hits</th><th>IP Address</th></tr></thead><tbody>${wl_ip_rows}</tbody></table>")
+    $([ -n "$wl_ip_rows" ] && echo "<div class='section-label'>Top offending IP addresses</div><table><thead><tr><th>Hits</th><th>IP Address</th></tr></thead><tbody>${wl_ip_rows}</tbody></table>")
   </div>
 </div>
 
 <div class="grid1">
   <div class="panel">
-    <div class="ph"><span class="pi">🐢</span><span class="pt">PHP Slowlog — Top Offending Plugin</span>
+    <div class="panel-header">
+      <span class="panel-title">PHP Slow Log — Top Offending Plugin</span>
       $([ -n "$sl_plugin" ] && echo "<span class='badge badge-warn'>${sl_count} slow entries</span>")
     </div>
     $(if [ -n "$sl_plugin" ]; then
-        echo "<div class='sl-meta'><table><tbody>"
-        echo "<tr><td>Plugin</td><td style='color:var(--acc);font-weight:600'>$(html_e "$sl_plugin")</td></tr>"
+        echo "<div class='kv-table'><table><tbody>"
+        echo "<tr><td>Plugin</td><td><strong>$(html_e "$sl_plugin")</strong></td></tr>"
         echo "<tr><td>Domain</td><td>$(html_e "$sl_domain")</td></tr>"
-        echo "<tr><td>Slow entries</td><td style='color:var(--org);font-weight:600'>${sl_count}</td></tr>"
+        echo "<tr><td>Slow entries</td><td><strong>${sl_count}</strong></td></tr>"
         echo "</tbody></table></div>"
         if [ -n "$sl_frame_rows" ]; then
-            echo "<div class='section-lbl'>Most frequent call stack frames</div>"
+            echo "<div class='section-label'>Most frequent call stack frames</div>"
             echo "<div class='frame-list'>${sl_frame_rows}</div>"
         fi
     else
-        echo "<div class='empty'>No slowlog data — slowlog not configured or no slow entries recorded</div>"
+        echo "<div class='empty'>No slow log data — slow log not configured or no entries recorded.</div>"
     fi)
   </div>
 </div>
 
 <div class="grid1">
   <div class="panel">
-    <div class="ph"><span class="pi">🗄</span><span class="pt">MySQL — Top Queries by Total Execution Time</span>
-      $([ "$mysql_avail" -eq 1 ] && echo "<span class='badge badge-warn'>performance_schema</span>" || echo "<span class='badge badge-alert'>unavailable</span>")
+    <div class="panel-header">
+      <span class="panel-title">MySQL — Top Queries by Total Execution Time</span>
+      $([ "$mysql_avail" -eq 1 ] && echo "<span class='badge badge-info'>performance_schema</span>" || echo "<span class='badge badge-alert'>Unavailable</span>")
     </div>
     $(if [ "$mysql_avail" -eq 1 ] && [ -n "$mysql_query_rows" ]; then
         echo "<div class='mysql-note'>Aggregated since last server restart or <code>TRUNCATE performance_schema.events_statements_summary_by_digest</code>. Sorted by total cumulative execution time.</div>"
         echo "<div style='overflow-x:auto'>"
         echo "<table>"
         echo "<thead><tr>"
-        echo "<th>DB / Table</th>"
+        echo "<th>Database / Table</th>"
         echo "<th>Query Digest</th>"
-        echo "<th style='text-align:right'>Calls</th>"
-        echo "<th style='text-align:right'>Total time</th>"
-        echo "<th style='text-align:right'>Avg time</th>"
-        echo "<th style='text-align:right'>Max time</th>"
-        echo "<th style='text-align:right'>Rows exam.</th>"
-        echo "<th style='text-align:right'>Rows sent</th>"
+        echo "<th class='t-right'>Calls</th>"
+        echo "<th class='t-right'>Total time</th>"
+        echo "<th class='t-right'>Avg time</th>"
+        echo "<th class='t-right'>Max time</th>"
+        echo "<th class='t-right'>Rows examined</th>"
+        echo "<th class='t-right'>Rows sent</th>"
         echo "<th>Last seen</th>"
         echo "</tr></thead>"
         echo "<tbody>${mysql_query_rows}</tbody>"
         echo "</table></div>"
     else
-        echo "<div class='empty'>$([ "$mysql_avail" -eq 0 ] && echo 'MySQL not accessible or performance_schema not enabled' || echo 'No query data available')</div>"
+        echo "<div class='empty'>$([ "$mysql_avail" -eq 0 ] && echo 'MySQL is not accessible or performance_schema is not enabled.' || echo 'No query data available.')</div>"
     fi)
   </div>
 </div>
 
-<footer>
-  <span>Generated by Server Monitor Dashboard · ${HOST_FULL} · ${NOW_FULL}</span>
-</footer>
+<div class="report-footer">
+  <span>Server Monitor Dashboard &middot; ${HOST_FULL}</span>
+  <span>Generated ${NOW_FULL}</span>
+</div>
+
 </div>
 </body>
 </html>
@@ -954,8 +1112,6 @@ HTMLEOF
     echo "  └─────────────────────────────────────────────────────"
     echo ""
 
-    # ── Update report.html in web root to point to latest ────────────
-    # Use a meta-refresh redirect so /report.html always shows newest
     local REL_PATH
     if [ -n "$REPORT_SUBDIR" ]; then
         REL_PATH="${REPORT_SUBDIR}/${NOW_SLUG}.html"
@@ -975,33 +1131,31 @@ HTMLEOF
 REDIREOF
     echo "  ✔  Latest redirect  : ${LATEST_URL}"
 
-    # ── Generate reports index page ───────────────────────────────────
     {
         echo '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
         echo '<meta name="viewport" content="width=device-width,initial-scale=1">'
         echo "<title>Reports — ${HOST_FULL}</title>"
-        echo '<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Syne:wght@700;800&display=swap" rel="stylesheet">'
-        echo '<style>body{background:#0b0e14;color:#cbd5e0;font-family:"IBM Plex Mono",monospace;padding:40px 24px;max-width:800px;margin:0 auto}h1{font-family:"Syne",sans-serif;font-size:28px;font-weight:800;color:#e2e8f0;margin-bottom:8px}p{color:#718096;font-size:12px;margin-bottom:32px}.report-list{list-style:none}.report-list li{border-bottom:1px solid #1e2535;padding:12px 0;display:flex;align-items:center;gap:12px}.report-list li:last-child{border-bottom:none}.report-list a{color:#00d4ff;text-decoration:none;font-size:13px}.report-list a:hover{text-decoration:underline}.ts{color:#4a5568;font-size:11px;margin-left:auto}.latest{background:rgba(0,212,255,.06);padding:12px 14px;border-radius:4px;border:1px solid rgba(0,212,255,.15)}</style>'
+        echo '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">'
+        echo '<style>body{background:#f8f9fa;color:#212529;font-family:Inter,system-ui,sans-serif;padding:40px 24px;max-width:860px;margin:0 auto;font-size:14px;-webkit-font-smoothing:antialiased}h1{font-size:22px;font-weight:600;color:#212529;margin-bottom:6px}p{color:#6c757d;font-size:13px;margin-bottom:28px}a{color:#1c7ed6;text-decoration:none}a:hover{text-decoration:underline}.report-list{list-style:none;border:1px solid #e2e6ea;border-radius:6px;overflow:hidden;background:#fff}.report-list li{border-bottom:1px solid #e2e6ea;padding:11px 16px;display:flex;align-items:center;gap:12px;font-size:13px}.report-list li:last-child{border-bottom:none}.report-list a{color:#1c7ed6}.ts{color:#adb5bd;font-size:12px;margin-left:auto;font-family:monospace}.latest{background:#e7f5ff;border-left:3px solid #1c7ed6}</style>'
         echo '</head><body>'
         echo "<h1>${HOST_FULL}</h1>"
-        echo "<p>Server performance reports · <a href='../report.html' style='color:#00d4ff'>latest report →</a></p>"
+        echo "<p>Server performance reports &middot; <a href='../report.html'>Latest report</a></p>"
         echo '<ul class="report-list">'
         local first=1
         for f in $(ls -t "$PUB_DIR"/*.html 2>/dev/null); do
             local fname=$(basename "$f")
             local fdate=$(echo "$fname" | sed 's/_/ /;s/-/:/g;s/\.html//')
             if [ "$first" -eq 1 ]; then
-                echo "<li class='latest'>🟢 <a href='${fname}'>${fname}</a><span class='ts'>Latest</span></li>"
+                echo "<li class='latest'><a href='${fname}'>${fname}</a><span class='ts'>Latest</span></li>"
                 first=0
             else
-                echo "<li>📄 <a href='${fname}'>${fname}</a><span class='ts'>${fdate}</span></li>"
+                echo "<li><a href='${fname}'>${fname}</a><span class='ts'>${fdate}</span></li>"
             fi
         done
         echo '</ul></body></html>'
     } > "${PUB_DIR}/index.html"
     echo "  ✔  Report index     : ${INDEX_URL}"
 
-    # ── Prune old reports (keep last 30) ──────────────────────────────
     local old_reports
     old_reports=$(ls -t "$PUB_DIR"/*.html 2>/dev/null | grep -v "index.html" | tail -n +31)
     if [ -n "$old_reports" ]; then
@@ -1009,10 +1163,8 @@ REDIREOF
         echo "  ✔  Pruned old reports (kept latest 30)"
     fi
 
-    # ── Optional: also POST JSON to remote endpoint ───────────────────
     if [ -n "$REPORT_ENDPOINT" ]; then
         local JSON_FILE="/tmp/monitor_report_${NOW_SLUG}.json"
-        # Build minimal JSON for remote ingest
         cat > "$JSON_FILE" << JSONEOF
 {"meta":{"generated":"$(json_str "$NOW_FULL")","host":"$(json_str "$HOST_FULL")","uptime":"$(json_str "$UPTIME_S")","load":"$(json_str "$LOAD")"}}
 JSONEOF
@@ -1026,7 +1178,6 @@ JSONEOF
     fi
 }
 
-# Trap Ctrl+C — print terminal report then write HTML to web root
 trap '
     echo ""
     echo "  Generating exit report..."
@@ -1053,11 +1204,7 @@ while true; do
     UPTIME_STR=$(uptime -p 2>/dev/null | sed 's/up //' || uptime | awk '{print $3,$4}' | tr -d ',')
     LOAD_AVG=$(uptime | awk -F'load average:' '{print $2}' | xargs)
 
-    # ══════════════════════════════════════════════
-    #  DISK WARNING — check before header renders
-    #  Shows a full-width alert banner if any mount
-    #  is at or above 98% used
-    # ══════════════════════════════════════════════
+    # ── DISK WARNING ──────────────────────────────
     DISK_WARN=""
     while read -r pct mount; do
         pct_num="${pct%%%}"   # strip the % sign
@@ -1066,7 +1213,7 @@ while true; do
         fi
     done < <(df -h --output=pcent,target 2>/dev/null | awk 'NR>1 && $1!="Use%"')
 
-    # ── HEADER ───────────────────────────────────
+    # ── HEADER ────────────────────────────────────
     hline '═' "$BLUE_D"
     hdr_left="  🖥  SYSTEM MONITOR DASHBOARD"
     pad=$(( TW - ${#hdr_left} - ${#NOW} - 4 ))
@@ -1074,10 +1221,8 @@ while true; do
     printf "${BG_HEADER}${CYAN}${BOLD}%s%*s${YELLOW}%s  ${R}\n" "$hdr_left" "$pad" "" "$NOW"
     hline '═' "$BLUE_D"
 
-    # ── DISK WARNING BANNER (shown only when triggered) ──
     if [ -n "$DISK_WARN" ]; then
         hline '█' "$BG_ALERT"
-        # Center the warning text
         warn_txt="  ⚠  CRITICAL DISK USAGE:  ${DISK_WARN}"
         warn_pad=$(( (TW - ${#warn_txt}) / 2 ))
         [ "$warn_pad" -lt 0 ] && warn_pad=0
@@ -1091,22 +1236,14 @@ while true; do
     printf "${DGRAY}◆ UPTIME:${R} ${WHITE}${BOLD}%-26s${R}  " "$UPTIME_STR"
     printf "${DGRAY}◆ LOAD AVG:${R} ${WHITE}${BOLD}%s${R}\n\n" "$LOAD_AVG"
 
-    # ══════════════════════════════════════════════
-    #  SYSTEM PRESSURE BAR — always visible
-    #  Sits directly below host line so it's the
-    #  first thing eyes land on during an incident.
-    #  Sources: /proc/stat (iowait), /proc/meminfo
-    #  (available/swap), vmstat (swap I/O),
-    #  ps D-state count
-    # ══════════════════════════════════════════════
+    # ── SYSTEM PRESSURE BAR ───────────────────────
     {
-        # ── CPU iowait % ──────────────────────────
-        # Read two snapshots 0.3s apart for an accurate delta
         read_cpu1=$(awk '/^cpu / {print $5, $6}' /proc/stat 2>/dev/null)
         read_total1=$(awk '/^cpu / {s=0; for(i=2;i<=NF;i++) s+=$i; print s}' /proc/stat 2>/dev/null)
         sleep 0.3
         read_cpu2=$(awk '/^cpu / {print $5, $6}' /proc/stat 2>/dev/null)
         read_total2=$(awk '/^cpu / {s=0; for(i=2;i<=NF;i++) s+=$i; print s}' /proc/stat 2>/dev/null)
+
         IOWAIT_PCT=$(awk -v c1="$read_cpu1" -v t1="$read_total1" \
                          -v c2="$read_cpu2" -v t2="$read_total2" '
             BEGIN {
@@ -1116,40 +1253,33 @@ while true; do
                 if (dtotal > 0) printf "%.0f", (diowait/dtotal)*100
                 else print "0"
             }')
+        IOWAIT_PCT=$(( ${IOWAIT_PCT:-0} + 0 ))
 
-        # ── Memory: available and total ───────────
         MEM_AVAIL=$(awk '/^MemAvailable:/{printf "%.1f", $2/1024/1024}' /proc/meminfo 2>/dev/null)
         MEM_TOTAL=$(awk '/^MemTotal:/{printf "%.1f", $2/1024/1024}' /proc/meminfo 2>/dev/null)
-        MEM_USED=$(awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{printf "%.0f", ((t-a)/t)*100}' /proc/meminfo 2>/dev/null)
+        MEM_USED=$(awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{
+            if(t>0) printf "%.0f", ((t-a)/t)*100; else print "0"}' /proc/meminfo 2>/dev/null)
+        MEM_USED=$(( ${MEM_USED:-0} + 0 ))
 
-        # ── Swap: used and I/O rates ──────────────
         SWAP_USED=$(awk '/^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{
             used=(t-f)/1024; printf "%.0fM", used}' /proc/meminfo 2>/dev/null)
         SWAP_TOTAL=$(awk '/^SwapTotal:/{printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null)
 
-        # Swap I/O: read two vmstat snapshots
         SWAP_IN=0; SWAP_OUT=0
         if command -v vmstat &>/dev/null; then
             vmstat_line=$(vmstat 1 2 2>/dev/null | tail -1)
-            SWAP_IN=$(echo  "$vmstat_line" | awk '{print $7}')
-            SWAP_OUT=$(echo "$vmstat_line" | awk '{print $8}')
+            SWAP_IN=$(echo  "$vmstat_line" | awk '{print $7+0}')
+            SWAP_OUT=$(echo "$vmstat_line" | awk '{print $8+0}')
         fi
-
-        # ── D-state (uninterruptible sleep) count ─
-        DSTATE=$(ps -eo stat 2>/dev/null | grep -c '^D' | tr -d '[:space:]')
-        DSTATE=$(( ${DSTATE:-0} + 0 ))
-
-        # ── OOM kills in last 100 dmesg lines ─────
-        OOM_COUNT=$(dmesg 2>/dev/null | tail -n 100 | grep -c "Out of memory\|oom-kill" | tr -d '[:space:]')
-        OOM_COUNT=$(( ${OOM_COUNT:-0} + 0 ))
-
-        # ── Sanitize all numerics — strip newlines/spaces that break [ -ge ] ──
-        IOWAIT_PCT=$(( ${IOWAIT_PCT:-0} + 0 ))
-        MEM_USED=$(( ${MEM_USED:-0} + 0 ))
         SWAP_IN=$(( ${SWAP_IN:-0} + 0 ))
         SWAP_OUT=$(( ${SWAP_OUT:-0} + 0 ))
 
-        # ── Colour helpers ────────────────────────
+        DSTATE=$(ps -eo stat 2>/dev/null | grep -c '^D' | tr -d '[:space:]')
+        DSTATE=$(( ${DSTATE:-0} + 0 ))
+
+        OOM_COUNT=$(dmesg 2>/dev/null | tail -n 100 | grep -c "Out of memory\|oom-kill" | tr -d '[:space:]')
+        OOM_COUNT=$(( ${OOM_COUNT:-0} + 0 ))
+
         iowait_col="${GREEN_S}"
         [ "$IOWAIT_PCT" -ge 20 ] && iowait_col="${ORANGE}"
         [ "$IOWAIT_PCT" -ge 50 ] && iowait_col="${RED}${BOLD}"
@@ -1171,19 +1301,18 @@ while true; do
 
         printf "${CYAN}${BOLD}  ▶  SYSTEM PRESSURE${R}"
 
-        # Alert label if things look bad
         if [ "$IOWAIT_PCT" -ge 50 ] || [ "$MEM_USED" -ge 95 ] || \
            [ "$DSTATE"     -ge 10 ] || [ "$OOM_COUNT" -ge 1 ]; then
             printf "  ${BG_ALERT}${RED}${BOLD}${BLINK} ⚠ HIGH LOAD DETECTED ${R}"
         fi
         printf "\n"
 
-        printf "  ${DGRAY}CPU iowait:${R} ${iowait_col}${BOLD}%-6s%%${R}  " "${IOWAIT_PCT:-0}"
-        printf "${DGRAY}Mem used:${R} ${mem_col}${BOLD}%-4s%%${R} ${DGRAY}(${R}${WHITE}${MEM_AVAIL}G avail / ${MEM_TOTAL}G${R}${DGRAY})${R}  "
-        printf "${DGRAY}Swap:${R} ${swap_col}${BOLD}%-6s${R}  "  "${SWAP_USED}"
-        printf "${DGRAY}Swap I/O in/out:${R} ${swap_col}${BOLD}%s/%s KB/s${R}  " "${SWAP_IN:-0}" "${SWAP_OUT:-0}"
-        printf "${DGRAY}D-state procs:${R} ${dstate_col}${BOLD}%s${R}  " "${DSTATE:-0}"
-        printf "${DGRAY}OOM kills:${R} ${oom_col}${BOLD}%s${R}\n" "${OOM_COUNT:-0}"
+        printf "  ${DGRAY}CPU iowait:${R} ${iowait_col}${BOLD}%-6s%%${R}  " "${IOWAIT_PCT}"
+        printf "${DGRAY}Mem used:${R} ${mem_col}${BOLD}%-4s%%${R} ${DGRAY}(${R}${WHITE}${MEM_AVAIL:-0}G avail / ${MEM_TOTAL:-0}G${R}${DGRAY})${R}  "
+        printf "${DGRAY}Swap:${R} ${swap_col}${BOLD}%-6s${R}  "  "${SWAP_USED:-0M}"
+        printf "${DGRAY}Swap I/O in/out:${R} ${swap_col}${BOLD}%s/%s KB/s${R}  " "$SWAP_IN" "$SWAP_OUT"
+        printf "${DGRAY}D-state procs:${R} ${dstate_col}${BOLD}%s${R}  " "$DSTATE"
+        printf "${DGRAY}OOM kills:${R} ${oom_col}${BOLD}%s${R}\n" "$OOM_COUNT"
     }
     hline '─' "$DGRAY"
 
@@ -1192,7 +1321,6 @@ while true; do
     # ════════════════════════════════════════════
     C1=$(mktemp); C2=$(mktemp)
 
-    # LEFT — CPU
     {
         printf "${YELLOW}${BOLD}  ▶  TOP CPU PROCESSES${R}\n"
         printf "  ${DGRAY}%-${COL_PROC_N}s %-${COL_PROC_NAME}s %s${R}\n" "#" "PROCESS" "CPU%"
@@ -1207,7 +1335,6 @@ while true; do
         done
     } > "$C1"
 
-    # RIGHT — Memory
     {
         printf "${YELLOW}${BOLD}  ▶  TOP MEMORY PROCESSES${R}\n"
         printf "  ${DGRAY}%-${COL_PROC_N}s %-${COL_PROC_NAME}s %s${R}\n" "#" "PROCESS" "MEM%"
@@ -1231,7 +1358,6 @@ while true; do
     # ════════════════════════════════════════════
     C1=$(mktemp); C2=$(mktemp)
 
-    # LEFT — Top URLs
     {
         printf "${YELLOW}${BOLD}  ▶  TOP URLs BY DOMAIN${R}\n"
         printf "  ${DGRAY}%-${COL_URL_HITS}s %-${COL_URL_DOM}s %s${R}\n" "HITS" "DOMAIN" "URL"
@@ -1249,19 +1375,22 @@ while true; do
         rm -f "$url_temp"
     } > "$C1"
 
-    # RIGHT — Top IPs & Traffic Spikes
     {
         printf "${CYAN}${BOLD}  ▶  TOP IPs & TRAFFIC SPIKES${R}\n"
         printf "  ${DGRAY}%-${COL_IP_HITS}s %-${COL_IP_ADDR}s %s${R}\n" "HITS" "IP ADDRESS" "Δ"
         printf "  ${DGRAY}%-${COL_IP_HITS}s %-${COL_IP_ADDR}s %s${R}\n" "────────" "────────────────────────────" "──────"
         new_state=$(mktemp)
-        awk '{print $1}' $ACCESSLOG_PATH 2>/dev/null | sort | uniq -c | sort -nr | head -8 | \
+        for log in $ACCESSLOG_PATH; do
+            [ -f "$log" ] && awk '{print $1}' "$log"
+        done 2>/dev/null | sort | uniq -c | sort -nr | head -8 | \
         while read -r count ip; do
             [ -z "$ip" ] && continue
+            count=$(( ${count:-0} + 0 ))
             echo "$ip $count" >> "$new_state"
-            prev=$(grep "^$ip " "$IP_STATE_FILE" 2>/dev/null | awk '{print $2}')
-            if [ -n "$prev" ]; then
-                diff=$((count - prev))
+            prev=$(grep "^$ip " "$IP_STATE_FILE" 2>/dev/null | awk '{print $2+0}')
+            prev=$(( ${prev:-0} + 0 ))
+            if [ -n "$prev" ] && [ "$prev" -gt 0 ]; then
+                diff=$(( count - prev ))
                 if   [ "$diff" -gt 100 ]; then chg="${RED}${BOLD}↑+${diff}${R}"
                 elif [ "$diff" -gt   0 ]; then chg="${ORANGE}↑+${diff}${R}"
                 elif [ "$diff" -lt   0 ]; then chg="${GREEN_S}↓${diff}${R}"
@@ -1285,7 +1414,6 @@ while true; do
     # ════════════════════════════════════════════
     C1=$(mktemp); C2=$(mktemp)
 
-    # LEFT — Network Connections
     {
         printf "${CYAN}${BOLD}  ▶  NETWORK CONNECTIONS${R}\n"
         printf "  ${DGRAY}%-${COL_NET_STATE}s %s${R}\n" "STATE" "COUNT"
@@ -1307,46 +1435,39 @@ while true; do
             printf "  ${sc}%-${COL_NET_STATE}s${R}  ${WHITE}%s${R}\n" "$state" "$cnt"
         done
         syn_count=$(netstat -ant 2>/dev/null | grep -c "SYN_RECV" | tr -d '[:space:]')
-        : "${syn_count:=0}"
+        syn_count=$(( ${syn_count:-0} + 0 ))
         if [ "$syn_count" -gt 20 ]; then
             printf "\n  ${RED}${BOLD}${BLINK}⚠ SYN FLOOD: %s conns!${R}\n" "$syn_count"
         fi
     } > "$C1"
 
-    # RIGHT — WP-Login
     {
         WL_NOW=$(date "+%H:%M:%S")
         WL_CUR_MIN=$(date "+%d/%b/%Y:%H:%M")
         WL_PREV_MIN=$(date -d "1 minute ago" "+%d/%b/%Y:%H:%M" 2>/dev/null || \
-                      date -v-1M "+%d/%b/%Y:%H:%M" 2>/dev/null)  # Linux / macOS fallback
+                      date -v-1M "+%d/%b/%Y:%H:%M" 2>/dev/null)
 
-        wplogin_raw=$(grep "wp-login.php" $ACCESSLOG_PATH 2>/dev/null)
+        wplogin_raw=""
+        for log in $ACCESSLOG_PATH; do
+            [ -f "$log" ] && wplogin_raw+=$(grep "wp-login.php" "$log" 2>/dev/null)$'\n'
+        done
 
-        # ── Determine if there are RECENT hits (current or prev minute) ──
-        # This drives the status indicator colour — red blink if active
-        # right now, green blink if clean, orange if hits exist but older
         wplogin_recent=$(echo "$wplogin_raw" | grep -c "${WL_CUR_MIN}\|${WL_PREV_MIN}" 2>/dev/null | tr -d '[:space:]')
         wplogin_recent=$(( ${wplogin_recent:-0} + 0 ))
         wplogin_total=$(echo "$wplogin_raw" | grep -c "wp-login" 2>/dev/null | tr -d '[:space:]')
         wplogin_total=$(( ${wplogin_total:-0} + 0 ))
 
-        # ── Status indicator: coloured blinking dot + time ────────────────
         if [ "$wplogin_recent" -gt 0 ]; then
-            # Active hits in last ~2 minutes — red alert
             status_dot="${RED}${BOLD}${BLINK}●${R}"
             status_label="${RED}${BOLD}${BLINK}  ⚠  WP-LOGIN.PHP — ACTIVE ATTACK${R}"
         elif [ "$wplogin_total" -gt 0 ]; then
-            # Hits exist in log but not recent — orange warning
             status_dot="${ORANGE}${BOLD}●${R}"
             status_label="${ORANGE}${BOLD}  ⚠  WP-LOGIN.PHP — PRIOR HITS${R}"
         else
-            # Completely clean — green all clear
             status_dot="${GREEN_S}${BOLD}${BLINK}●${R}"
             status_label="${GREEN_S}${BOLD}  ✔  WP-LOGIN.PHP — CLEAR${R}"
         fi
 
-        # ── Header line with status dot and current time on right ────────
-        # Calculate padding to right-align the time within the half-column
         label_vis="  WP-LOGIN.PHP MONITOR"
         time_str="as of ${WL_NOW}"
         pad=$(( HALF - ${#label_vis} - ${#time_str} - 4 ))
@@ -1354,11 +1475,9 @@ while true; do
         printf "  %b ${DGRAY}WP-LOGIN.PHP MONITOR%*s${DIM}%s${R}\n" \
             "$status_dot" "$pad" "" "$time_str"
 
-        # ── Status label ─────────────────────────────────────────────────
         printf "%b\n" "$status_label"
 
         if [ "$wplogin_total" -gt 0 ]; then
-            # ── Recent hit rate summary ───────────────────────────────────
             printf "  ${DGRAY}Total hits in log:${R} ${ORANGE}${BOLD}%s${R}  " "$wplogin_total"
             printf "${DGRAY}Active (last 2m):${R} "
             if [ "$wplogin_recent" -gt 0 ]; then
@@ -1393,7 +1512,6 @@ while true; do
                     }
                 }' | sort -nr | head -6 | \
             while read -r hits domain ip method ts; do
-                # Highlight rows with recent activity
                 echo "$wplogin_raw" | grep -q "$ip.*${WL_CUR_MIN}\|$ip.*${WL_PREV_MIN}" \
                     && row_col="${RED}" || row_col="${ORANGE}"
                 [ "$method" = "POST" ] && mfmt="${RED}${BOLD}[POST]${R}" || mfmt="${GREEN_S}[GET] ${R}"
@@ -1408,10 +1526,8 @@ while true; do
     render_two_cols "$C1" "$C2"
     rm -f "$C1" "$C2"
     hline '─' "$DGRAY"
-
     # ════════════════════════════════════════════
-    #  BLOCK 4: FILE CHANGES (left) | PHP SLOWLOG (right)
-    #  File cache is scanned every SCAN_INTERVAL
+    #  BLOCK 7: FILE CHANGES (left) | PHP SLOWLOG (right)
     # ════════════════════════════════════════════
     C1=$(mktemp); C2=$(mktemp)
 
@@ -1421,9 +1537,6 @@ while true; do
         LAST_FILE_SCAN=$(( ${LAST_FILE_SCAN:-0} + 0 ))
 
         if (( CUR_TIME - LAST_FILE_SCAN > SCAN_INTERVAL )); then
-
-            # Pass 1 — collect every changed file into a flat tsv:
-            #   domain <TAB> type <TAB> plugin <TAB> mod_datetime
             find /home/nginx/domains/*/public/wp-content/{plugins,themes} \
                 -maxdepth 3 -mmin -1440 -type f \
                 \( -name "*.php" -o -name "*.js" \) 2>/dev/null \
@@ -1436,15 +1549,13 @@ while true; do
             done \
             | awk -F'\t' '
             {
-                key = $1 "\t" $2 "\t" $3    # domain + type + plugin name
+                key = $1 "\t" $2 "\t" $3
                 count[key]++
-                # keep the latest mod time per plugin
                 if ($4 > latest[key]) latest[key] = $4
             }
             END {
                 for (k in count) {
                     split(k, p, "\t")
-                    # p[1]=domain  p[2]=type  p[3]=plugin
                     printf "%s\t%s\t%s\t%d\t%s\n", p[1], p[2], p[3], count[k], latest[k]
                 }
             }' \
@@ -1471,9 +1582,8 @@ while true; do
                 else
                     t_col="\033[38;5;171m"; t_label="Theme"
                 fi
-
-                # Colour the file count: orange if > 5 files changed, green otherwise
-                if [ "${count:-0}" -gt 5 ] 2>/dev/null; then
+                count=$(( ${count:-0} + 0 ))
+                if [ "$count" -gt 5 ]; then
                     c_col="\033[38;5;214m"
                 else
                     c_col="\033[38;5;82m"
@@ -1487,7 +1597,6 @@ while true; do
         fi
     } > "$C1"
 
-    # RIGHT — PHP Slowlog (paired with file changes — both are "what changed" views)
     {
         if [ -f "$SLOWLOG" ]; then
             printf "${RED_S}${BOLD}  ▶  PHP SLOWLOG — TOP CULPRITS${R}\n"
@@ -1511,19 +1620,12 @@ while true; do
 
     # ════════════════════════════════════════════
     #  BLOCK 5: LIVE URL HITS — FULL WIDTH
-    #
-    #  Aggregates the current-minute access logs
-    #  by URL + IP, shows hit count and Δ change
-    #  since the last refresh — same concept as
-    #  Top URLs but scoped to the live 20s window
     # ════════════════════════════════════════════
     {
-        LIVE_STATE="/tmp/live_velocity.state"
-        LIVE_URL_STATE="/tmp/live_url_ip.state"   # persists URL+IP counts between refreshes
+        LIVE_URL_STATE="/tmp/live_url_ip.state"
         NEW_LIVE_STATE=$(mktemp)
         CUR_MIN=$(date "+%d/%b/%Y:%H:%M")
 
-        # Column widths — URL gets whatever is left
         COL_LV_HITS=6
         COL_LV_DELTA=10
         COL_LV_IP=18
@@ -1535,14 +1637,13 @@ while true; do
 
         printf "${CYAN}${BOLD}  ▶  LIVE TRAFFIC  ${DGRAY}(current minute window: %s)${R}\n" "$CUR_MIN"
 
-        # Collect current-minute lines: domain  ip  method  url  status
         for log in $ACCESSLOG_PATH; do
             [ -f "$log" ] || continue
             dom=$(echo "$log" | awk -F'/' '{print $5}')
             tail -n 500 "$log" | grep "$CUR_MIN" | \
                 awk -v d="$dom" '{
                     ip=$1
-                    meth=$6; gsub(/\042/,"",meth)   # strip quotes
+                    meth=$6; gsub(/\042/,"",meth)
                     url=$7
                     status=$9
                     print d, ip, meth, url, status
@@ -1551,15 +1652,12 @@ while true; do
 
         if [ -s "$NEW_LIVE_STATE" ]; then
 
-            # ── Section 1: IP + Domain velocity summary ──────────────────
-            # Aggregate by domain+ip only — shows who is hitting hardest
-            # and how their count changed since last refresh
+            LIVE_VEL_STATE="/tmp/live_vel_domip.state"
+
             COL_VS_HITS=6
             COL_VS_DOM=24
             COL_VS_IP=18
             COL_VS_DELTA=12
-            # remaining width split across extra columns
-            COL_VS_PAD=$(( TW - COL_VS_HITS - COL_VS_DOM - COL_VS_IP - COL_VS_DELTA - 12 ))
 
             printf "\n  ${CYAN}${DIM}▸  TOP IPs THIS MINUTE${R}  ${DGRAY}domain · ip · hits · Δ since last refresh${R}\n"
             printf "  ${DGRAY}%-${COL_VS_HITS}s  %-${COL_VS_DOM}s  %-${COL_VS_IP}s  %s${R}\n" \
@@ -1568,18 +1666,15 @@ while true; do
                 "──────" "$(printf '─%.0s' $(seq 1 $COL_VS_DOM))" \
                 "$(printf '─%.0s' $(seq 1 $COL_VS_IP))" "────────────"
 
-            # Build velocity state file path for IP+domain deltas
-            LIVE_VEL_STATE="/tmp/live_vel_domip.state"
-
             awk '{print $1, $2}' "$NEW_LIVE_STATE" | \
             sort | uniq -c | sort -nr | head -10 | \
             while read -r count dom ip; do
                 [ -z "$ip" ] && continue
+                count=$(( ${count:-0} + 0 ))
 
                 state_key="${dom}|${ip}"
                 prev=$(grep "^${state_key}=" "$LIVE_VEL_STATE" 2>/dev/null | cut -d'=' -f2)
                 prev=$(( ${prev:-0} + 0 ))
-                count=$(( ${count:-0} + 0 ))
 
                 if [ "$prev" -eq 0 ]; then
                     delta="${ORANGE}${BOLD}NEW${R}"
@@ -1602,7 +1697,6 @@ while true; do
 
             mv "${LIVE_VEL_STATE}.new" "$LIVE_VEL_STATE" 2>/dev/null
 
-            # ── Section 2: URL detail table ───────────────────────────────
             printf "\n  ${CYAN}${DIM}▸  URL BREAKDOWN${R}  ${DGRAY}url · ip · method · status · Δ${R}\n"
             printf "  ${DGRAY}%-${COL_LV_HITS}s  %-${COL_LV_DELTA}s  %-${COL_LV_DOM}s  %-${COL_LV_IP}s  %-${COL_LV_METHOD}s  %-${COL_LV_URL}s  %s${R}\n" \
                 "HITS" "Δ CHANGE" "DOMAIN" "IP" "METH" "URL" "ST"
@@ -1614,8 +1708,6 @@ while true; do
                 "$(printf '─%.0s' $(seq 1 $COL_LV_URL))" \
                 "──"
 
-            # Aggregate by domain+ip+method+url+status, count hits, keep last status
-            # Output: count  domain  ip  method  url  status
             sort "$NEW_LIVE_STATE" | awk '
             {
                 key = $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5
@@ -1629,12 +1721,11 @@ while true; do
 
             while IFS=$'\t' read -r hits dom ip meth url status; do
                 [ -z "$url" ] && continue
+                hits=$(( ${hits:-0} + 0 ))
 
-                # ── Delta vs previous refresh ─────
                 state_key="${dom}|${ip}|${url}"
                 prev=$(grep "^${state_key}=" "$LIVE_URL_STATE" 2>/dev/null | cut -d'=' -f2)
                 prev=$(( ${prev:-0} + 0 ))
-                hits=$(( ${hits:-0} + 0 ))
 
                 if [ "$prev" -eq 0 ]; then
                     delta="${ORANGE}${BOLD}NEW${R}"
@@ -1646,18 +1737,14 @@ while true; do
                     fi
                 fi
 
-                # Save updated count for next cycle
-                # Use a temp file to avoid reading/writing same file mid-loop
                 echo "${state_key}=${hits}" >> "${LIVE_URL_STATE}.new"
 
-                # ── Colour: method ────────────────
                 case "$meth" in
                     POST|PUT|DELETE) mc="${RED_S}" ;;
                     GET)             mc="${CYAN_S}" ;;
                     *)               mc="${GRAY}" ;;
                 esac
 
-                # ── Colour: HTTP status ───────────
                 case "${status:0:1}" in
                     5) sc="${RED}${BOLD}" ;;
                     4) sc="${ORANGE}" ;;
@@ -1665,7 +1752,6 @@ while true; do
                     *)  sc="${GREEN_S}" ;;
                 esac
 
-                # ── Truncate URL to column width ──
                 if [ "${#url}" -gt "$COL_LV_URL" ]; then
                     url="${url:0:$(( COL_LV_URL - 1 ))}…"
                 fi
@@ -1680,7 +1766,6 @@ while true; do
 
             done
 
-            # Rotate state file atomically
             mv "${LIVE_URL_STATE}.new" "$LIVE_URL_STATE" 2>/dev/null
 
         else
@@ -1693,11 +1778,6 @@ while true; do
 
     # ════════════════════════════════════════════
     #  BLOCK 6: MYSQL ACTIVE PROCESSES — FULL WIDTH
-    #
-    #  MySQL gets its own full-width block because
-    #  query text is too long for a half-column.
-    #  Each process shows a summary line then the
-    #  full query wrapped to terminal width.
     # ════════════════════════════════════════════
     {
         printf "${MAGENTA}${BOLD}  ▶  MYSQL ACTIVE PROCESSES${R}\n"
@@ -1722,33 +1802,28 @@ while true; do
         if [ -z "$mysql_out" ]; then
             printf "  ${GRAY}${DIM}(no active queries)${R}\n"
         else
-            # Use process substitution so IFS=$'\t' applies cleanly per-line
             while IFS=$'\t' read -r id db time state query; do
                 [[ "$id" == "ID" ]] && continue
                 [ -z "$id" ]        && continue
 
-                # Time colouring: red ≥ 5s, orange otherwise
-                if [ "${time:-0}" -ge 5 ] 2>/dev/null; then
-                    tc="\033[38;5;196m"   # red
+                time=$(( ${time:-0} + 0 ))
+                if [ "$time" -ge 5 ]; then
+                    tc="\033[38;5;196m"
                 else
-                    tc="\033[38;5;214m"   # orange
+                    tc="\033[38;5;214m"
                 fi
 
-                # ── Summary line: ID  DB  TIME  STATE ──────────────
                 printf "  \033[38;5;244m%-${COL_MYSQL_ID}s\033[0m" "$id"
                 printf " \033[38;5;82m%-${COL_MYSQL_DB}.${COL_MYSQL_DB}s\033[0m" "$db"
                 printf " ${tc}%-${COL_MYSQL_TIME}s\033[0m" "${time}s"
                 printf " \033[38;5;45m%-${COL_MYSQL_STATE}.${COL_MYSQL_STATE}s\033[0m\n" "$state"
 
-                # ── Full query, word-wrapped at COL_MYSQL_QUERY ──────
-                # Normalize whitespace: collapse newlines/tabs to single space
                 clean_query=$(echo "$query" | tr '\n\t' '  ' | tr -s ' ')
                 echo "$clean_query" | fold -s -w "$COL_MYSQL_QUERY" | \
                 while IFS= read -r qline; do
                     printf "  \033[38;5;240m│\033[0m \033[38;5;255m%s\033[0m\n" "$qline"
                 done
 
-                # ── Per-process separator ────────────────────────────
                 printf "  \033[38;5;237m%s\033[0m\n" \
                     "$(printf '╌%.0s' $(seq 1 $(( TW - 4 ))))"
             done <<< "$mysql_out"
@@ -1756,16 +1831,10 @@ while true; do
     }
     hline '─' "$DGRAY"
 
-     # ════════════════════════════════════════════
-    #  BLOCK 7: NGINX ERROR LOG MONITOR — FULL WIDTH
-    #
-    #  Reads the last 200 lines of each domain's
-    #  error.log, groups by error type + request,
-    #  shows delta (+N) vs previous refresh cycle,
-    #  and highlights the client IP and snippet.
+    # ════════════════════════════════════════════
+    #  BLOCK 9: NGINX ERROR LOG MONITOR — FULL WIDTH
     # ════════════════════════════════════════════
     {
-        # Compute snippet column width from what's left after fixed columns
         COL_ERR_SNIPPET=$(( TW - COL_ERR_DOM - COL_ERR_TIME - COL_ERR_DELTA - COL_ERR_CLIENT - COL_ERR_REQ - 16 ))
         [ "$COL_ERR_SNIPPET" -lt 30 ] && COL_ERR_SNIPPET=30
 
@@ -1785,40 +1854,28 @@ while true; do
 
         for errlog in $ERRORLOG_PATH; do
             [ -f "$errlog" ] || continue
-
-            # Extract domain from path: /home/nginx/domains/DOMAIN/log/error.log
             domain=$(echo "$errlog" | cut -d'/' -f5)
 
-            # Parse the last 200 lines — each line format:
-            # 2026/02/25 00:11:51 [error] PID#TID: *ID MESSAGE, client: IP, server: DOMAIN, request: "METHOD PATH PROTO", host: "HOST"
             tail -n 200 "$errlog" 2>/dev/null | awk '
             /\[error\]/ {
-                # ── Timestamp ──────────────────────────────────
                 ts = $1 " " $2
-
-                # ── Error snippet: everything after the *ID ────
-                # Field 5 onwards is the message; strip the *NNN prefix
                 snippet = ""
                 for (i=5; i<=NF; i++) snippet = snippet " " $i
                 sub(/^ \*[0-9]+ /, "", snippet)
 
-                # ── Client IP ──────────────────────────────────
                 client = ""
                 if (match(snippet, /client: ([0-9.]+|[0-9a-f:]+)/, arr)) {
                     client = arr[1]
                 } else {
-                    # fallback: find "client: X.X.X.X" manually
                     n = split(snippet, parts, ", ")
                     for (j=1; j<=n; j++) {
                         if (parts[j] ~ /^client:/) { client = parts[j]; sub(/^client: /,"",client); break }
                     }
                 }
 
-                # ── Request path ───────────────────────────────
                 req = ""
                 if (match(snippet, /request: "([^"]+)"/, arr2)) {
                     req = arr2[1]
-                    # trim to METHOD + PATH only, drop HTTP version
                     sub(/ HTTP\/[0-9.]+$/, "", req)
                 } else {
                     n2 = split(snippet, parts2, ", ")
@@ -1827,12 +1884,10 @@ while true; do
                     }
                 }
 
-                # ── Core error message (strip trailing metadata) ─
                 core = snippet
                 sub(/, client:.*$/, "", core)
                 gsub(/^[ \t]+|[ \t]+$/, "", core)
 
-                # ── Key: domain + core error (dedup similar errors) ─
                 key = client "|" req "|" core
                 if (!(key in seen)) {
                     seen[key] = 1
@@ -1852,31 +1907,27 @@ while true; do
             }' | sort -t$'\t' -k1,1r | head -6 | \
             while IFS=$'\t' read -r ts client cnt req msg; do
                 found_any=1
+                cnt=$(( ${cnt:-0} + 0 ))
 
-                # Build state key for delta calculation
                 state_key="${domain}|${client}|${req}"
                 echo "${state_key}=${cnt}" >> "$NEW_ERR_STATE"
 
-                # Delta vs last refresh
                 prev_cnt=$(grep "^${state_key}=" "$ERRLOG_STATE" 2>/dev/null | cut -d'=' -f2)
-                if [ -n "$prev_cnt" ] && [ "$prev_cnt" -ne "$cnt" ] 2>/dev/null; then
+                prev_cnt=$(( ${prev_cnt:-0} + 0 ))
+
+                if [ "$prev_cnt" -gt 0 ] && [ "$cnt" -ne "$prev_cnt" ]; then
                     diff=$(( cnt - prev_cnt ))
                     if [ "$diff" -gt 0 ]; then
                         delta="${RED}${BOLD}+${diff}${R}"
-                        age_label="${RED}${BOLD}NEW${R}"
                     else
                         delta="${GREEN_S}${diff}${R}"
-                        age_label="${GRAY}OLD${R}"
                     fi
-                elif [ -z "$prev_cnt" ]; then
+                elif [ "$prev_cnt" -eq 0 ]; then
                     delta="${ORANGE}${BOLD}NEW${R}"
-                    age_label="${ORANGE}${BOLD}NEW${R}"
                 else
                     delta="${DGRAY}—${R}"
-                    age_label="${DGRAY}—${R}"
                 fi
 
-                # Truncate message to snippet column width
                 msg_short="${msg:0:$COL_ERR_SNIPPET}"
 
                 printf "  \033[38;5;114m%-${COL_ERR_DOM}.${COL_ERR_DOM}s\033[0m" "$domain"
@@ -1888,7 +1939,6 @@ while true; do
             done
         done
 
-        # Rotate state file so next refresh has fresh deltas
         [ -s "$NEW_ERR_STATE" ] && mv "$NEW_ERR_STATE" "$ERRLOG_STATE" || rm -f "$NEW_ERR_STATE"
 
         if [ "$found_any" -eq 0 ]; then
@@ -1897,15 +1947,11 @@ while true; do
     }
     hline '─' "$DGRAY"
 
-    # ════════════════════════════════════════════
-    #  BLOCK 8: PHP-FPM Pools (left) | MySQL Health (right)
+     # ════════════════════════════════════════════
+    #  BLOCK 4: PHP-FPM Pools (left) | MySQL Health (right)
     # ════════════════════════════════════════════
     C1=$(mktemp); C2=$(mktemp)
 
-    # LEFT — PHP-FPM pool status
-    # Reads /proc/net/unix to find fpm socket paths, then
-    # queries each pool's status page via cgi-fcgi.
-    # Falls back to ps worker count if unreachable.
     {
         printf "${CYAN}${BOLD}  ▶  PHP-FPM POOLS${R}\n"
         printf "  ${DGRAY}%-${COL_FPM_POOL}s %-${COL_FPM_ACT}s %-${COL_FPM_IDLE}s %-${COL_FPM_MAX}s %-${COL_FPM_QUEUE}s %s${R}\n" \
@@ -1915,7 +1961,6 @@ while true; do
 
         fpm_found=0
 
-        # Method 1: query status pages via unix sockets using cgi-fcgi
         if command -v cgi-fcgi &>/dev/null; then
             for sock in /var/run/php*.sock /run/php/*.sock /tmp/php*.sock; do
                 [ -S "$sock" ] || continue
@@ -1929,7 +1974,7 @@ while true; do
                 idle=$(echo   "$status_raw" | grep "^idle processes:"    | awk '{print $NF}')
                 maxc=$(echo   "$status_raw" | grep "^max children reached" | awk '{print $NF}')
                 queue=$(echo  "$status_raw" | grep "^listen queue:"      | awk '{print $NF}')
-                maxq=$(echo   "$status_raw" | grep "^max listen queue:"  | awk '{print $NF}')
+                maxq=$(echo  "$status_raw" | grep "^max listen queue:"  | awk '{print $NF}')
 
                 [ -z "$active" ] && continue
                 fpm_found=1
@@ -1947,15 +1992,14 @@ while true; do
                 fi
 
                 printf "  ${WHITE}%-${COL_FPM_POOL}.${COL_FPM_POOL}s${R} " "$pool"
-                printf "${ORANGE}%-${COL_FPM_ACT}s${R} "    "${active:-0}"
-                printf "${GRAY}%-${COL_FPM_IDLE}s${R} "     "${idle:-0}"
+                printf "${ORANGE}%-${COL_FPM_ACT}s${R} "    "$active"
+                printf "${GRAY}%-${COL_FPM_IDLE}s${R} "     "$idle"
                 printf "${DGRAY}%-${COL_FPM_MAX}s${R} "     "${maxc:-?}"
-                printf "${YELLOW}%-${COL_FPM_QUEUE}s${R} "  "${queue:-0}"
+                printf "${YELLOW}%-${COL_FPM_QUEUE}s${R} "  "$queue"
                 printf "%b\n" "$st"
             done
         fi
 
-        # Method 2: fallback — count php-fpm worker processes via ps
         if [ "$fpm_found" -eq 0 ]; then
             ps -eo comm,stat 2>/dev/null | awk '
             /php-fpm/ || /php[0-9].*-fpm/ {
@@ -1976,16 +2020,11 @@ while true; do
         fi
     } > "$C1"
 
-    # RIGHT — MySQL Health metrics
-    # Uses mysqladmin status + SHOW GLOBAL STATUS for key counters.
-    # QPS is computed as a delta against the previous refresh so it
-    # shows actual queries/sec rather than a lifetime cumulative.
     {
         printf "${MAGENTA}${BOLD}  ▶  MYSQL HEALTH${R}\n"
         printf "  ${DGRAY}%-${COL_MH_LABEL}s %s${R}\n" "METRIC" "VALUE"
         printf "  ${DGRAY}%-${COL_MH_LABEL}s %s${R}\n" "$(printf '─%.0s' $(seq 1 $COL_MH_LABEL))" "──────────────"
 
-        # Fetch all status vars in one query
         mysql_health=$(mysql --batch --silent -e "
             SHOW GLOBAL STATUS WHERE Variable_name IN (
                 'Threads_connected','Threads_running','max_used_connections',
@@ -2014,48 +2053,59 @@ while true; do
 
             # ── QPS delta ─────────────────────────
             prev_q=$(cat "$MYSQL_QPS_STATE" 2>/dev/null || echo 0)
+            questions=$(( ${questions:-0} + 0 ))   # fix: coerce to int — prevents arithmetic syntax error on empty value
+            max_conn=$(( ${max_conn:-0} + 0 ))       # fix: strip whitespace/newlines before division
+            threads_conn=$(( ${threads_conn:-0} + 0 ))
             QPS=0
-            if [ -n "$questions" ] && [ "${prev_q:-0}" -gt 0 ] 2>/dev/null; then
+            if [ -n "$questions" ] && [ "${prev_q:-0}" -gt 0 ] && [ "$questions" -ge "${prev_q:-0}" ] 2>/dev/null; then
                 QPS=$(( (questions - prev_q) / 20 ))   # 20s refresh interval
                 [ "$QPS" -lt 0 ] && QPS=0
             fi
             echo "${questions:-0}" > "$MYSQL_QPS_STATE"
 
-            # ── InnoDB buffer pool hit rate ────────
+            # ── InnoDB buffer pool hit rate ────────────────────────────
             BP_HIT="n/a"
-            if [ -n "$bp_req" ] && [ "${bp_req:-0}" -gt 0 ] 2>/dev/null; then
-                BP_HIT=$(awk -v r="${bp_reads:-0}" -v req="$bp_req" \
+                if [ "$bp_req" -gt 0 ]; then
+                BP_HIT=$(awk -v r="$bp_reads" -v req="$bp_req" \
                     'BEGIN{printf "%.1f%%", (1-(r/req))*100}')
             fi
 
-            # ── Colour thresholds ──────────────────
+            # ── Colour thresholds ──────────────────────────────────────
             conn_pct=0
-            [ "${max_conn:-0}" -gt 0 ] && conn_pct=$(( ${threads_conn:-0} * 100 / max_conn ))
-            conn_col="${GREEN_S}";   [ "$conn_pct" -ge 70 ] && conn_col="${ORANGE}";  [ "$conn_pct" -ge 90 ] && conn_col="${RED}${BOLD}"
-            run_col="${GREEN_S}";    [ "${threads_run:-0}" -ge 10 ] && run_col="${ORANGE}"; [ "${threads_run:-0}" -ge 30 ] && run_col="${RED}${BOLD}"
-            slow_col="${GREEN_S}";   [ "${slow_q:-0}" -ge 5  ] && slow_col="${ORANGE}"; [ "${slow_q:-0}" -ge 20 ] && slow_col="${RED}${BOLD}"
-            lock_col="${GREEN_S}";   [ "${lock_wait:-0}" -ge 1  ] && lock_col="${ORANGE}"; [ "${lock_wait:-0}" -ge 10 ] && lock_col="${RED}${BOLD}"
-            bp_num=$(echo "$BP_HIT" | tr -d '%')
-            bp_col="${GREEN_S}";     [ "${bp_num:-100}" != "n/a" ] && [ "${bp_num%.*}" -lt 99 ] 2>/dev/null && bp_col="${ORANGE}"
-                                     [ "${bp_num:-100}" != "n/a" ] && [ "${bp_num%.*}" -lt 95 ] 2>/dev/null && bp_col="${RED}${BOLD}"
-            qps_col="${GREEN_S}";    [ "${QPS:-0}" -ge 500  ] && qps_col="${ORANGE}"; [ "${QPS:-0}" -ge 2000 ] && qps_col="${RED}${BOLD}"
+            [ "$max_conn" -gt 0 ] && conn_pct=$(( threads_conn * 100 / max_conn ))
+
+            conn_col="${GREEN_S}";   [ "$conn_pct"    -ge 70 ] && conn_col="${ORANGE}";  [ "$conn_pct"    -ge 90 ] && conn_col="${RED}${BOLD}"
+            run_col="${GREEN_S}";    [ "$threads_run"  -ge 10 ] && run_col="${ORANGE}";   [ "$threads_run"  -ge 30 ] && run_col="${RED}${BOLD}"
+            slow_col="${GREEN_S}";   [ "$slow_q"       -ge 5  ] && slow_col="${ORANGE}";  [ "$slow_q"       -ge 20 ] && slow_col="${RED}${BOLD}"
+            lock_col="${GREEN_S}";   [ "$lock_wait"    -ge 1  ] && lock_col="${ORANGE}";  [ "$lock_wait"    -ge 10 ] && lock_col="${RED}${BOLD}"
+            qps_col="${GREEN_S}";    [ "$QPS"          -ge 500 ] && qps_col="${ORANGE}";  [ "$QPS"          -ge 2000 ] && qps_col="${RED}${BOLD}"
+
+            bp_col="${GREEN_S}"
+            if [ "$BP_HIT" != "n/a" ]; then
+                bp_col=$(awk -v h="$BP_HIT" 'BEGIN{
+                    v = h + 0
+                    if (v < 95)      print "\033[38;5;196m\033[1m"
+                    else if (v < 99) print "\033[38;5;214m"
+                    else             print "\033[38;5;114m"
+                }')
+            fi
 
             printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${conn_col}%s / %s${R} ${DGRAY}(%s%%)${R}\n" \
-                "Connections" "${threads_conn:-?}" "${max_conn:-?}" "$conn_pct"
+                "Connections" "$threads_conn" "$max_conn" "$conn_pct"
             printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${run_col}%s${R}\n" \
-                "Threads running"  "${threads_run:-?}"
+                "Threads running"  "$threads_run"
             printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${qps_col}%s q/s${R}\n" \
-                "QPS (last 20s)"   "${QPS}"
+                "QPS (last 20s)"   "$QPS"
             printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${slow_col}%s${R}\n" \
-                "Slow queries"     "${slow_q:-?}"
+                "Slow queries"     "$slow_q"
             printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${lock_col}%s${R}\n" \
-                "Table lock waits" "${lock_wait:-?}"
+                "Table lock waits" "$lock_wait"
             printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${bp_col}%s${R}\n" \
-                "InnoDB hit rate"  "${BP_HIT}"
+                "InnoDB hit rate"  "$BP_HIT"
             printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${ORANGE}%s${R}\n" \
-                "Row lock waits"   "${row_locks:-?}"
+                "Row lock waits"   "$row_locks"
             printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${GRAY}%s${R}\n" \
-                "Aborted connects" "${aborted:-?}"
+                "Aborted connects" "$aborted"
         fi
     } > "$C2"
 
@@ -2063,13 +2113,10 @@ while true; do
     rm -f "$C1" "$C2"
     hline '─' "$DGRAY"
 
+
+
     # ════════════════════════════════════════════
-    #  BLOCK 9: DISK I/O — FULL WIDTH
-    #
-    #  Uses /proc/diskstats with a 1s delta to
-    #  compute real KB/s read+write and await ms.
-    #  Only shows physical disks (sd*, nvme*, vd*).
-    #  Falls back to iostat if available.
+    #  BLOCK 8: DISK I/O — FULL WIDTH
     # ════════════════════════════════════════════
     {
         printf "${YELLOW}${BOLD}  ▶  DISK I/O${R}\n"
@@ -2079,16 +2126,14 @@ while true; do
             "──────────" "──────────" "──────────" "────────────" "────────" "──────────"
 
         if command -v iostat &>/dev/null; then
-            # iostat -x: extended stats, 2 samples 1s apart, show only the second
             iostat -xk 1 2 2>/dev/null | awk '
             /^(sd|nvme|vd|xvd|hd)[a-z0-9]/ {
                 dev=$1; rkbs=$6; wkbs=$7; await=$10; util=$NF
-                # colour thresholds
                 uc="\033[38;5;82m"
                 if (util+0 >= 50) uc="\033[38;5;214m"
                 if (util+0 >= 85) uc="\033[38;5;196m\033[1m"
                 ac="\033[38;5;82m"
-                if (await+0 >= 20) ac="\033[38;5;214m"
+                if (await+0 >= 20)  ac="\033[38;5;214m"
                 if (await+0 >= 100) ac="\033[38;5;196m\033[1m"
 
                 st="✔ OK"
@@ -2103,20 +2148,18 @@ while true; do
                     ac, sprintf("%.1fms", await),
                     uc, sprintf("%.0f%%", util),
                     stc, st
-            }' | tail -n +2   # skip first sample (cumulative), keep second (interval)
+            }' | tail -n +2
         else
-            # Fallback: /proc/diskstats two-snapshot delta
             snap1=$(awk '/^[ ]*[0-9]+ [0-9]+ (sd|nvme|vd)/ {print $3,$6,$10,$13}' /proc/diskstats 2>/dev/null)
             sleep 1
             snap2=$(awk '/^[ ]*[0-9]+ [0-9]+ (sd|nvme|vd)/ {print $3,$6,$10,$13}' /proc/diskstats 2>/dev/null)
 
             paste <(echo "$snap1") <(echo "$snap2") | awk '{
                 dev=$1
-                dr=($6-$2)*512/1024    # sectors→KB
+                dr=($6-$2)*512/1024
                 dw=($7-$3)*512/1024
-                dio_ms=($8-$4)         # ms spent in I/O
-                # simple util: ms doing I/O in last 1000ms
-                util=(dio_ms > 1000) ? 100 : dio_ms/10
+                dio_ms=($8-$4)
+                util=(dio_ms > 1000) ? 100 : (dio_ms > 0 ? dio_ms/10 : 0)
 
                 uc="\033[38;5;82m"
                 if (util >= 50) uc="\033[38;5;214m"
@@ -2138,19 +2181,17 @@ while true; do
     }
     hline '─' "$DGRAY"
 
-   
 
-    # ── FOOTER ───────────────────────────────────
+
+    # ── FOOTER ────────────────────────────────────
     printf "\n"
     hline '═' "$BLUE_D"
-    printf "  ${GRAY}${DIM}Refreshing in ${R}${BOLD}${CYAN}20s${R}  ${DGRAY}•${R}  ${GRAY}${DIM}Ctrl+C to exit${R}\n"
+    printf "  ${GRAY}${DIM}Refreshing in ${R}${BOLD}${CYAN}20s${R}  ${DGRAY}•${R}  ${GRAY}${DIM}Ctrl+C to exit + generate report${R}\n"
     hline '═' "$BLUE_D"
     printf "\n"
 
     } > "$FRAME"
 
-    # ── Atomic render — clear and print the complete frame in one shot ──
-    # This prevents any partial output appearing during data collection
     clear
     cat "$FRAME"
 
