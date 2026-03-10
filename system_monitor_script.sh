@@ -39,6 +39,11 @@ touch "$ERRLOG_STATE"
 MYSQL_QPS_STATE="/tmp/mysql_qps.state"
 touch "$MYSQL_QPS_STATE"
 PHPFPM_STATUS_URL="http://127.0.0.1/status"
+ABUSEIPDB_KEY="${ABUSEIPDB_KEY:-}"
+ABUSEIPDB_CACHE="/tmp/.ipcache_${$}"
+touch "$ABUSEIPDB_CACHE" && chmod 600 "$ABUSEIPDB_CACHE"
+
+
 
 # ══════════════════════════════════════════════════════
 #  LAYOUT CONFIG — all column math in one place
@@ -1188,6 +1193,7 @@ trap '
     echo ""
     generate_html_report
     rm -f "$FRAME"
+    rm -f "$ABUSEIPDB_CACHE"
     exit 0
 ' INT
 
