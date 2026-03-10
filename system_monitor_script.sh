@@ -1420,7 +1420,7 @@ while true; do
     # ════════════════════════════════════════════
     C1=$(mktemp); C2=$(mktemp)
 
-    {
+  {
         printf "${CYAN}${BOLD}  ▶  NETWORK CONNECTIONS${R}\n"
         printf "  ${DGRAY}%-${COL_NET_STATE}s %s${R}\n" "STATE" "COUNT"
         printf "  ${DGRAY}%-${COL_NET_STATE}s %s${R}\n" "───────────────────────" "─────"
@@ -1440,10 +1440,73 @@ while true; do
             esac
             printf "  ${sc}%-${COL_NET_STATE}s${R}  ${WHITE}%s${R}\n" "$state" "$cnt"
         done
-        syn_count=$(netstat -ant 2>/dev/null | grep -c "SYN_RECV" | tr -d '[:space:]')
+
+        # ── SYN_RECV detail ───────────────────────────────────────────────
+        # Collect all SYN_RECV rows once into a temp var — avoids running
+        # netstat twice and keeps the flood check + IP breakdown consistent.
+        syn_raw=$(netstat -ant 2>/dev/null | grep "SYN_RECV")
+        syn_count=$(echo "$syn_raw" | grep -c "SYN_RECV" | tr -d '[:space:]')
         syn_count=$(( ${syn_count:-0} + 0 ))
-        if [ "$syn_count" -gt 20 ]; then
-            printf "\n  ${RED}${BOLD}${BLINK}⚠ SYN FLOOD: %s conns!${R}\n" "$syn_count"
+
+        if [ "$syn_count" -gt 0 ]; then
+
+            # Column widths for the SYN IP table
+            COL_SYN_CNT=6
+            COL_SYN_IP=20
+            COL_SYN_PORT=8
+            COL_SYN_FLAG=12    # "FLOOD" warning label
+
+            if [ "$syn_count" -gt 20 ]; then
+                printf "\n  ${RED}${BOLD}${BLINK}⚠ SYN FLOOD DETECTED: %s active SYN_RECV connections${R}\n" "$syn_count"
+            else
+                printf "\n  ${ORANGE}${BOLD}⚠ SYN_RECV: %s active connections${R}\n" "$syn_count"
+            fi
+
+            printf "\n  ${DGRAY}%-${COL_SYN_CNT}s  %-${COL_SYN_IP}s  %-${COL_SYN_PORT}s  %s${R}\n" \
+                "HITS" "SOURCE IP" "DST PORT" "STATUS"
+            printf "  ${DGRAY}%-${COL_SYN_CNT}s  %-${COL_SYN_IP}s  %-${COL_SYN_PORT}s  %s${R}\n" \
+                "──────" "────────────────────" "────────" "──────────────"
+
+            # Extract source IP and destination port from SYN_RECV rows,
+            # count per IP, sort by count descending.
+            # netstat -ant columns: Proto Recv-Q Send-Q Local-Addr Foreign-Addr State
+            # Foreign-Addr is the SYN source:  ip:port  →  we want just the ip
+            echo "$syn_raw" | awk '{
+                foreign = $5
+                # strip port — handle both ip:port and [ipv6]:port
+                sub(/:[^:]+$/, "", foreign)
+                gsub(/[\[\]]/, "", foreign)   # strip IPv6 brackets
+                dst = $4
+                sub(/.*:/, "", dst)           # keep only the destination port
+                print foreign, dst
+            }' | sort | uniq -c | sort -nr | head -20 | \
+            while read -r cnt src_ip dst_port; do
+                [ -z "$src_ip" ] && continue
+                cnt=$(echo "$cnt" | tr -d '[:space:]')
+                cnt=$(( ${cnt:-0} + 0 ))
+
+                # Flag IPs appearing more than 5 times — likely spoofed/flood source
+                if [ "$cnt" -gt 5 ]; then
+                    flag="${RED}${BOLD}⚠ FLOOD${R}"
+                    ip_col="${RED}${BOLD}"
+                    cnt_col="${RED}${BOLD}"
+                else
+                    flag="${DGRAY}—${R}"
+                    ip_col="${ORANGE}"
+                    cnt_col="${ORANGE}"
+                fi
+
+                printf "  ${cnt_col}%-${COL_SYN_CNT}s${R}  " "$cnt"
+                printf "${ip_col}%-${COL_SYN_IP}s${R}  "     "$src_ip"
+                printf "${GRAY}%-${COL_SYN_PORT}s${R}  "     "$dst_port"
+                printf "%b\n"                                 "$flag"
+            done
+
+            # Summary line — unique source IPs
+            unique_syn_ips=$(echo "$syn_raw" | awk '{print $5}' | \
+                sed 's/:[^:]*$//' | sort -u | grep -c "." | tr -d '[:space:]')
+            printf "\n  ${DGRAY}Unique source IPs in SYN_RECV: ${WHITE}%s${R}\n" \
+                "${unique_syn_ips:-0}"
         fi
     } > "$C1"
 
