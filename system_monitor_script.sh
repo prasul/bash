@@ -1,7 +1,7 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════
 #   SYSTEM MONITOR DASHBOARD — AI Prasul :-P
-#   v2.0 — arithmetic & formatting bugs fixed
+#   v2.0 — for centminmod
 # ═══════════════════════════════════════════════
 
 R="\033[0m"
@@ -39,11 +39,10 @@ touch "$ERRLOG_STATE"
 MYSQL_QPS_STATE="/tmp/mysql_qps.state"
 touch "$MYSQL_QPS_STATE"
 PHPFPM_STATUS_URL="http://127.0.0.1/status"
+
 ABUSEIPDB_KEY="${ABUSEIPDB_KEY:-}"
 ABUSEIPDB_CACHE="/tmp/.ipcache_${$}"
 touch "$ABUSEIPDB_CACHE" && chmod 600 "$ABUSEIPDB_CACHE"
-
-
 
 # ══════════════════════════════════════════════════════
 #  LAYOUT CONFIG — all column math in one place
@@ -1322,6 +1321,86 @@ while true; do
     }
     hline '─' "$DGRAY"
 
+
+    # ── _ip_enrich ip ────────────────────────────────────────────────────
+# Queries AbuseIPDB (abuse score) + ip-api.com (country + ISP).
+# Results cached in $ABUSEIPDB_CACHE as:  ip|score|cc|isp
+#
+# Called at most once per unique IP per script run.
+# Every subsequent call for the same IP is a pure grep — no network.
+# Safe to call from any block, any subshell (writes to file not a var).
+#
+# If ABUSEIPDB_KEY is empty, score is "-" but geo still works.
+# If no network, both fields fall back to "-" / "--" gracefully.
+_ip_enrich() {
+    local ip="$1"
+
+    # Return cached result immediately — no API call
+    local cached
+    cached=$(grep "^${ip}|" "$ABUSEIPDB_CACHE" 2>/dev/null | head -1)
+    if [ -n "$cached" ]; then
+        echo "$cached"; return
+    fi
+
+    # Skip RFC-1918 / loopback — pointless to look these up
+    local oct1 oct2
+    oct1=$(echo "$ip" | cut -d. -f1)
+    oct2=$(echo "$ip" | cut -d. -f2)
+    case "${oct1}.${oct2}" in
+        10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|192.168.*|127.*|0.*)
+            echo "${ip}|-|--|private" >> "$ABUSEIPDB_CACHE"
+            echo "${ip}|-|--|private"; return ;;
+    esac
+
+    # ── 1. AbuseIPDB — confidence score 0-100 ────────────────────────
+    local score="-"
+    if [ -n "$ABUSEIPDB_KEY" ]; then
+        local abuse_raw
+        abuse_raw=$(curl -sS --max-time 3 -G "https://api.abuseipdb.com/api/v2/check" \
+            --data-urlencode "ipAddress=${ip}" \
+            -d "maxAgeInDays=90" \
+            -H "Key: ${ABUSEIPDB_KEY}" \
+            -H "Accept: application/json" 2>/dev/null)
+        score=$(echo "$abuse_raw" | grep -oP '"abuseConfidenceScore"\s*:\s*\K[0-9]+')
+        score="${score:--}"
+    fi
+
+    # ── 2. ip-api.com — country code + ISP (free, no key needed) ─────
+    # HTTP only on free tier — no sensitive data in request so that's fine
+    local geo_raw cc isp
+    geo_raw=$(curl -sS --max-time 3 \
+        "http://ip-api.com/json/${ip}?fields=countryCode,isp,org" 2>/dev/null)
+    cc=$(echo  "$geo_raw" | grep -oP '"countryCode"\s*:\s*"\K[^"]+')
+    isp=$(echo "$geo_raw" | grep -oP '"isp"\s*:\s*"\K[^"]+')
+    [ -z "$isp" ] && \
+        isp=$(echo "$geo_raw" | grep -oP '"org"\s*:\s*"\K[^"]+')  # fallback to org
+    cc="${cc:---}"
+    isp="${isp:--}"
+    [ "${#isp}" -gt 24 ] && isp="${isp:0:23}…"   # truncate to fit column
+
+    local result="${ip}|${score}|${cc}|${isp}"
+    echo "$result" >> "$ABUSEIPDB_CACHE"
+    echo "$result"
+}
+
+# ── _abuse_colour score ───────────────────────────────────────────────
+# Prints the ANSI colour code for a given abuse score.
+# Read-only — safe to call from any subshell.
+_abuse_colour() {
+    local score="$1"
+    if [[ "$score" =~ ^[0-9]+$ ]]; then
+        if   [ "$score" -ge 75 ]; then printf '%s' "${RED}${BOLD}"
+        elif [ "$score" -ge 25 ]; then printf '%s' "${ORANGE}"
+        else                           printf '%s' "${GREEN_S}"
+        fi
+    else
+        printf '%s' "${DGRAY}"
+    fi
+}
+
+
+
+
     # ════════════════════════════════════════════
     #  BLOCK 1: CPU (left) | Memory (right)
     # ════════════════════════════════════════════
@@ -1365,51 +1444,178 @@ while true; do
     C1=$(mktemp); C2=$(mktemp)
 
     {
-        printf "${YELLOW}${BOLD}  ▶  TOP URLs BY DOMAIN${R}\n"
-        printf "  ${DGRAY}%-${COL_URL_HITS}s %-${COL_URL_DOM}s %s${R}\n" "HITS" "DOMAIN" "URL"
-        printf "  ${DGRAY}%-${COL_URL_HITS}s %-${COL_URL_DOM}s %s${R}\n" "──────" "────────────────────" "──────────────────────────"
-        url_temp=$(mktemp)
-        for logfile in $ACCESSLOG_PATH; do
-            [ -f "$logfile" ] || continue
-            domain=$(echo "$logfile" | awk -F'/' '{print $5}')
-            awk -v dom="$domain" '{print dom, $7}' "$logfile" >> "$url_temp" 2>/dev/null
-        done
-        sort "$url_temp" | uniq -c | sort -nr | head -10 | \
-        awk -v o="${ORANGE}" -v g="${GREEN_S}" -v c="${CYAN_S}" -v r="${R}" \
-            -v h="$COL_URL_HITS" -v d="$COL_URL_DOM" -v u="$COL_URL_PATH" \
-            '{printf "  %s%-"h"s%s  %s%-"d"."d"s%s  %s%-"u"."u"s%s\n", o,$1,r, g,$2,r, c,$3,r}'
-        rm -f "$url_temp"
-    } > "$C1"
-
-    {
         printf "${CYAN}${BOLD}  ▶  TOP IPs & TRAFFIC SPIKES${R}\n"
-        printf "  ${DGRAY}%-${COL_IP_HITS}s %-${COL_IP_ADDR}s %s${R}\n" "HITS" "IP ADDRESS" "Δ"
-        printf "  ${DGRAY}%-${COL_IP_HITS}s %-${COL_IP_ADDR}s %s${R}\n" "────────" "────────────────────────────" "──────"
+
+        # Column widths — extended to fit CC, ABUSE, ISP
+        COL_IP_HITS=8
+        COL_IP_ADDR=20
+        COL_IP_CC=4
+        COL_IP_ABUSE=6
+        COL_IP_ISP=24
+        COL_IP_DELTA=12
+
+        printf "  ${DGRAY}%-${COL_IP_HITS}s  %-${COL_IP_CC}s  %-${COL_IP_ABUSE}s  %-${COL_IP_ADDR}s  %-${COL_IP_ISP}s  %s${R}\n" \
+            "HITS" "CC" "ABUSE" "IP ADDRESS" "ISP" "Δ CHANGE"
+        printf "  ${DGRAY}%-${COL_IP_HITS}s  %-${COL_IP_CC}s  %-${COL_IP_ABUSE}s  %-${COL_IP_ADDR}s  %-${COL_IP_ISP}s  %s${R}\n" \
+            "────────" "────" "──────" \
+            "$(printf '─%.0s' $(seq 1 $COL_IP_ADDR))" \
+            "$(printf '─%.0s' $(seq 1 $COL_IP_ISP))" \
+            "────────────"
+
         new_state=$(mktemp)
+
+        # Collect top IPs into a temp file first so we can:
+        #   a) prefetch enrichment before entering the while-read subshell
+        #   b) avoid running the log scan twice
+        top_ips_tmp=$(mktemp)
         for log in $ACCESSLOG_PATH; do
             [ -f "$log" ] && awk '{print $1}' "$log"
-        done 2>/dev/null | sort | uniq -c | sort -nr | head -8 | \
+        done 2>/dev/null | sort | uniq -c | sort -nr | head -8 > "$top_ips_tmp"
+
+        # ── Prefetch enrichment for every IP in this list ─────────────────
+        # Reads from ABUSEIPDB_CACHE if already resolved by BLOCK 5 or any
+        # earlier block — zero extra API calls for IPs already seen.
+        # Only truly new IPs (not yet in cache) trigger a curl call here.
+        while read -r count ip; do
+            [ -z "$ip" ] && continue
+            _ip_enrich "$ip" > /dev/null
+        done < "$top_ips_tmp"
+
+        # ── Render rows — all lookups are now pure cache reads ─────────────
         while read -r count ip; do
             [ -z "$ip" ] && continue
             count=$(( ${count:-0} + 0 ))
             echo "$ip $count" >> "$new_state"
-            prev=$(grep "^$ip " "$IP_STATE_FILE" 2>/dev/null | awk '{print $2+0}')
+
+            # Pull enrichment from cache file (no curl possible here)
+            entry=$(grep "^${ip}|" "$ABUSEIPDB_CACHE" 2>/dev/null | head -1)
+            lscore=$(echo "$entry" | cut -d'|' -f2); lscore="${lscore:--}"
+            lcc=$(echo    "$entry" | cut -d'|' -f3); lcc="${lcc:---}"
+            lisp=$(echo   "$entry" | cut -d'|' -f4); lisp="${lisp:--}"
+
+            # Colour the abuse score
+            if [[ "$lscore" =~ ^[0-9]+$ ]]; then
+                if   [ "$lscore" -ge 75 ]; then acol="${RED}${BOLD}"
+                elif [ "$lscore" -ge 25 ]; then acol="${ORANGE}"
+                else                            acol="${GREEN_S}"
+                fi
+            else
+                acol="${DGRAY}"
+            fi
+
+            # Delta vs last refresh
+            prev=$(grep "^$ip " "$IP_STATE_FILE" 2>/dev/null | awk '{print $2+0}' | tr -d '[:space:]')
             prev=$(( ${prev:-0} + 0 ))
-            if [ -n "$prev" ] && [ "$prev" -gt 0 ]; then
+            if [ "$prev" -gt 0 ]; then
                 diff=$(( count - prev ))
-                if   [ "$diff" -gt 100 ]; then chg="${RED}${BOLD}↑+${diff}${R}"
-                elif [ "$diff" -gt   0 ]; then chg="${ORANGE}↑+${diff}${R}"
-                elif [ "$diff" -lt   0 ]; then chg="${GREEN_S}↓${diff}${R}"
-                else chg="${DGRAY}—${R}"
+                if   [ "$diff" -gt 100 ]; then chg="${RED}${BOLD}↑ +${diff}${R}"
+                elif [ "$diff" -gt   0 ]; then chg="${ORANGE}↑ +${diff}${R}"
+                elif [ "$diff" -lt   0 ]; then chg="${GREEN_S}↓ ${diff}${R}"
+                else                           chg="${DGRAY}—${R}"
                 fi
             else
                 chg="${CYAN}${BOLD}NEW${R}"
             fi
-            printf "  ${ORANGE}%-${COL_IP_HITS}s${R}  ${CYAN_S}%-${COL_IP_ADDR}.${COL_IP_ADDR}s${R}  %b\n" \
-                "$count" "$ip" "$chg"
-        done
+
+            printf "  ${ORANGE}%-${COL_IP_HITS}s${R}  "             "$count"
+            printf "${GRAY}%-${COL_IP_CC}s${R}  "                   "$lcc"
+            printf "${acol}%-${COL_IP_ABUSE}s${R}  "                "$lscore"
+            printf "${CYAN_S}%-${COL_IP_ADDR}.${COL_IP_ADDR}s${R}  " "$ip"
+            printf "${DIM}%-${COL_IP_ISP}.${COL_IP_ISP}s${R}  "     "$lisp"
+            printf "%b\n"                                             "$chg"
+
+        done < "$top_ips_tmp"
+
+        rm -f "$top_ips_tmp"
         mv "$new_state" "$IP_STATE_FILE" 2>/dev/null
-    } > "$C2"
+    } > "$C1"
+
+{
+        printf "${CYAN}${BOLD}  ▶  TOP IPs & TRAFFIC SPIKES${R}\n"
+
+        # Column widths — extended to fit CC, ABUSE, ISP
+        COL_IP_HITS=8
+        COL_IP_ADDR=20
+        COL_IP_CC=4
+        COL_IP_ABUSE=6
+        COL_IP_ISP=24
+        COL_IP_DELTA=12
+
+        printf "  ${DGRAY}%-${COL_IP_HITS}s  %-${COL_IP_CC}s  %-${COL_IP_ABUSE}s  %-${COL_IP_ADDR}s  %-${COL_IP_ISP}s  %s${R}\n" \
+            "HITS" "CC" "ABUSE" "IP ADDRESS" "ISP" "Δ CHANGE"
+        printf "  ${DGRAY}%-${COL_IP_HITS}s  %-${COL_IP_CC}s  %-${COL_IP_ABUSE}s  %-${COL_IP_ADDR}s  %-${COL_IP_ISP}s  %s${R}\n" \
+            "────────" "────" "──────" \
+            "$(printf '─%.0s' $(seq 1 $COL_IP_ADDR))" \
+            "$(printf '─%.0s' $(seq 1 $COL_IP_ISP))" \
+            "────────────"
+
+        new_state=$(mktemp)
+
+        # Collect top IPs into a temp file first so we can:
+        #   a) prefetch enrichment before entering the while-read subshell
+        #   b) avoid running the log scan twice
+        top_ips_tmp=$(mktemp)
+        for log in $ACCESSLOG_PATH; do
+            [ -f "$log" ] && awk '{print $1}' "$log"
+        done 2>/dev/null | sort | uniq -c | sort -nr | head -8 > "$top_ips_tmp"
+
+        # ── Prefetch enrichment for every IP in this list ─────────────────
+        # Reads from ABUSEIPDB_CACHE if already resolved by BLOCK 5 or any
+        # earlier block — zero extra API calls for IPs already seen.
+        # Only truly new IPs (not yet in cache) trigger a curl call here.
+        while read -r count ip; do
+            [ -z "$ip" ] && continue
+            _ip_enrich "$ip" > /dev/null
+        done < "$top_ips_tmp"
+
+        # ── Render rows — all lookups are now pure cache reads ─────────────
+        while read -r count ip; do
+            [ -z "$ip" ] && continue
+            count=$(( ${count:-0} + 0 ))
+            echo "$ip $count" >> "$new_state"
+
+            # Pull enrichment from cache file (no curl possible here)
+            entry=$(grep "^${ip}|" "$ABUSEIPDB_CACHE" 2>/dev/null | head -1)
+            lscore=$(echo "$entry" | cut -d'|' -f2); lscore="${lscore:--}"
+            lcc=$(echo    "$entry" | cut -d'|' -f3); lcc="${lcc:---}"
+            lisp=$(echo   "$entry" | cut -d'|' -f4); lisp="${lisp:--}"
+
+            # Colour the abuse score
+            if [[ "$lscore" =~ ^[0-9]+$ ]]; then
+                if   [ "$lscore" -ge 75 ]; then acol="${RED}${BOLD}"
+                elif [ "$lscore" -ge 25 ]; then acol="${ORANGE}"
+                else                            acol="${GREEN_S}"
+                fi
+            else
+                acol="${DGRAY}"
+            fi
+
+            # Delta vs last refresh
+            prev=$(grep "^$ip " "$IP_STATE_FILE" 2>/dev/null | awk '{print $2+0}' | tr -d '[:space:]')
+            prev=$(( ${prev:-0} + 0 ))
+            if [ "$prev" -gt 0 ]; then
+                diff=$(( count - prev ))
+                if   [ "$diff" -gt 100 ]; then chg="${RED}${BOLD}↑ +${diff}${R}"
+                elif [ "$diff" -gt   0 ]; then chg="${ORANGE}↑ +${diff}${R}"
+                elif [ "$diff" -lt   0 ]; then chg="${GREEN_S}↓ ${diff}${R}"
+                else                           chg="${DGRAY}—${R}"
+                fi
+            else
+                chg="${CYAN}${BOLD}NEW${R}"
+            fi
+
+            printf "  ${ORANGE}%-${COL_IP_HITS}s${R}  "             "$count"
+            printf "${GRAY}%-${COL_IP_CC}s${R}  "                   "$lcc"
+            printf "${acol}%-${COL_IP_ABUSE}s${R}  "                "$lscore"
+            printf "${CYAN_S}%-${COL_IP_ADDR}.${COL_IP_ADDR}s${R}  " "$ip"
+            printf "${DIM}%-${COL_IP_ISP}.${COL_IP_ISP}s${R}  "     "$lisp"
+            printf "%b\n"                                             "$chg"
+
+        done < "$top_ips_tmp"
+
+        rm -f "$top_ips_tmp"
+        mv "$new_state" "$IP_STATE_FILE" 2>/dev/null
+    }> "$C2"
 
     render_two_cols "$C1" "$C2"
     rm -f "$C1" "$C2"
@@ -1420,7 +1626,7 @@ while true; do
     # ════════════════════════════════════════════
     C1=$(mktemp); C2=$(mktemp)
 
-  {
+    {
         printf "${CYAN}${BOLD}  ▶  NETWORK CONNECTIONS${R}\n"
         printf "  ${DGRAY}%-${COL_NET_STATE}s %s${R}\n" "STATE" "COUNT"
         printf "  ${DGRAY}%-${COL_NET_STATE}s %s${R}\n" "───────────────────────" "─────"
@@ -1516,16 +1722,52 @@ while true; do
         WL_PREV_MIN=$(date -d "1 minute ago" "+%d/%b/%Y:%H:%M" 2>/dev/null || \
                       date -v-1M "+%d/%b/%Y:%H:%M" 2>/dev/null)
 
-        wplogin_raw=""
+        # ── Collect all wp-login.php lines from every access log ──────────
+        # Store as a temp file instead of a variable — large log grep output
+        # in a variable can silently truncate or cause word-splitting issues.
+        WL_TMP=$(mktemp)
         for log in $ACCESSLOG_PATH; do
-            [ -f "$log" ] && wplogin_raw+=$(grep "wp-login.php" "$log" 2>/dev/null)$'\n'
+            [ -f "$log" ] || continue
+            dom=$(echo "$log" | awk -F'/' '{print $5}')
+            grep "wp-login.php" "$log" 2>/dev/null | awk -v d="$dom" '{
+                ip     = $1
+                ts     = $4; gsub(/\[/, "", ts)
+                method = $6; gsub(/"/, "", method)
+                status = $9
+                print d, ip, ts, method, status
+            }' >> "$WL_TMP"
         done
 
-        wplogin_recent=$(echo "$wplogin_raw" | grep -c "${WL_CUR_MIN}\|${WL_PREV_MIN}" 2>/dev/null | tr -d '[:space:]')
-        wplogin_recent=$(( ${wplogin_recent:-0} + 0 ))
-        wplogin_total=$(echo "$wplogin_raw" | grep -c "wp-login" 2>/dev/null | tr -d '[:space:]')
+        # ── Strip monitoring/trusted IPs from results ────────────────────
+        # Define these near the top of the main script alongside your other
+        # config variables:
+        #
+        #   WL_EXCLUDE_IPS="2607:5300:205:200::6cbe 57.128.189.19"
+        #
+        # Space-separated list — IPv4 and IPv6 both supported.
+        # The filter runs once on WL_TMP before any counting or rendering,
+        # so excluded IPs disappear from totals, the live table, and reports.
+        if [ -n "${WL_EXCLUDE_IPS:-}" ]; then
+            # Build a grep -F pattern: one literal IP per line
+            exclude_pattern=$(printf '%s
+' $WL_EXCLUDE_IPS)
+            # Column 2 of WL_TMP is the IP — grep -v removes matching lines
+            grep_tmp=$(mktemp)
+            while IFS= read -r excl_ip; do
+                [ -z "$excl_ip" ] && continue
+                grep -v "^[^ ]*  *${excl_ip} " "$WL_TMP" > "$grep_tmp"                     && mv "$grep_tmp" "$WL_TMP"
+            done <<< "$exclude_pattern"
+            rm -f "$grep_tmp"
+        fi
+
+        # ── Counts ────────────────────────────────────────────────────────
+        wplogin_total=$(wc -l < "$WL_TMP" | tr -d '[:space:]')
         wplogin_total=$(( ${wplogin_total:-0} + 0 ))
 
+        wplogin_recent=$(grep -c "${WL_CUR_MIN}\|${WL_PREV_MIN}" "$WL_TMP" 2>/dev/null | tr -d '[:space:]')
+        wplogin_recent=$(( ${wplogin_recent:-0} + 0 ))
+
+        # ── Status indicator ──────────────────────────────────────────────
         if [ "$wplogin_recent" -gt 0 ]; then
             status_dot="${RED}${BOLD}${BLINK}●${R}"
             status_label="${RED}${BOLD}${BLINK}  ⚠  WP-LOGIN.PHP — ACTIVE ATTACK${R}"
@@ -1533,7 +1775,7 @@ while true; do
             status_dot="${ORANGE}${BOLD}●${R}"
             status_label="${ORANGE}${BOLD}  ⚠  WP-LOGIN.PHP — PRIOR HITS${R}"
         else
-            status_dot="${GREEN_S}${BOLD}${BLINK}●${R}"
+            status_dot="${GREEN_S}●${R}"
             status_label="${GREEN_S}${BOLD}  ✔  WP-LOGIN.PHP — CLEAR${R}"
         fi
 
@@ -1543,10 +1785,10 @@ while true; do
         [ "$pad" -lt 1 ] && pad=1
         printf "  %b ${DGRAY}WP-LOGIN.PHP MONITOR%*s${DIM}%s${R}\n" \
             "$status_dot" "$pad" "" "$time_str"
-
         printf "%b\n" "$status_label"
 
         if [ "$wplogin_total" -gt 0 ]; then
+
             printf "  ${DGRAY}Total hits in log:${R} ${ORANGE}${BOLD}%s${R}  " "$wplogin_total"
             printf "${DGRAY}Active (last 2m):${R} "
             if [ "$wplogin_recent" -gt 0 ]; then
@@ -1555,42 +1797,109 @@ while true; do
                 printf "${GREEN_S}0${R}\n"
             fi
 
-            printf "  ${DGRAY}%-${COL_WL_HITS}s %-${COL_WL_DOM}s %-${COL_WL_IP}s %-${COL_WL_METHOD}s %s${R}\n" \
-                "HITS" "DOMAIN" "IP" "METHOD" "LAST SEEN"
-            printf "  ${DGRAY}%-${COL_WL_HITS}s %-${COL_WL_DOM}s %-${COL_WL_IP}s %-${COL_WL_METHOD}s %s${R}\n" \
-                "────" "────────────────────" "──────────────────────────" "──────" "──────────────"
+            # ── Column widths ─────────────────────────────────────────────
+            COL_WL_HITS=6
+            COL_WL_CC=4
+            COL_WL_ABUSE=6
+            COL_WL_IP=20
+            COL_WL_ISP=24
+            COL_WL_DOM=20
+            COL_WL_METHOD=7
+            COL_WL_STATUS=4
+            COL_WL_TS=20
 
-            echo "$wplogin_raw" | awk '{
-                match($0, /access\.log:/);
-                if (RSTART > 0) {
-                    filename = substr($0, 1, RSTART+9);
-                    split(filename, p, "/"); domain = p[5];
-                    content = substr($0, RSTART+10);
-                    split(content, parts, " "); ip = parts[1];
-                    ts = $4; gsub(/\[/, "", ts);
-                    method = $6; gsub(/\042/, "", method);
-                    print domain, ip, ts, method
+            printf "\n"
+            printf "  ${DGRAY}%-${COL_WL_HITS}s  %-${COL_WL_CC}s  %-${COL_WL_ABUSE}s  %-${COL_WL_IP}s  %-${COL_WL_ISP}s  %-${COL_WL_DOM}s  %-${COL_WL_METHOD}s  %-${COL_WL_STATUS}s  %s${R}\n" \
+                "HITS" "CC" "ABUSE" "IP ADDRESS" "ISP" "DOMAIN" "METHOD" "ST" "LAST SEEN"
+            printf "  ${DGRAY}%-${COL_WL_HITS}s  %-${COL_WL_CC}s  %-${COL_WL_ABUSE}s  %-${COL_WL_IP}s  %-${COL_WL_ISP}s  %-${COL_WL_DOM}s  %-${COL_WL_METHOD}s  %-${COL_WL_STATUS}s  %s${R}\n" \
+                "──────" "────" "──────" \
+                "$(printf '─%.0s' $(seq 1 $COL_WL_IP))" \
+                "$(printf '─%.0s' $(seq 1 $COL_WL_ISP))" \
+                "$(printf '─%.0s' $(seq 1 $COL_WL_DOM))" \
+                "───────" "────" "────────────────────"
+
+            # ── Aggregate: hits per domain+ip+method, keep latest timestamp ─
+            # Pure awk — no grep/sort pipeline fragility, works on the clean
+            # temp file where each line is already:  domain ip ts method status
+            AGG_TMP=$(mktemp)
+            awk '{
+                dom=$1; ip=$2; ts=$3; meth=$4; status=$5
+                key = dom SUBSEP ip SUBSEP meth SUBSEP status
+                count[key]++
+                # keep the most recent timestamp (lexicographic sort works for
+                # dd/Mon/YYYY:HH:MM:SS format)
+                if (ts > last_ts[key]) last_ts[key] = ts
+            }
+            END {
+                for (k in count) {
+                    split(k, f, SUBSEP)
+                    print count[k], f[1], f[2], f[3], f[4], last_ts[k]
                 }
-            }' | sort -k1,1 -k2,2 -k3,3r | awk '
-                !seen[$1,$2,$4]++ { count[$1,$2,$4]=1; last_ts[$1,$2,$4]=$3 }
-                seen[$1,$2,$4]>1  { count[$1,$2,$4]++ }
-                END {
-                    for (i in count) {
-                        split(i, sep, SUBSEP)
-                        print count[i], sep[1], sep[2], sep[3], last_ts[i]
-                    }
-                }' | sort -nr | head -6 | \
-            while read -r hits domain ip method ts; do
-                echo "$wplogin_raw" | grep -q "$ip.*${WL_CUR_MIN}\|$ip.*${WL_PREV_MIN}" \
-                    && row_col="${RED}" || row_col="${ORANGE}"
-                [ "$method" = "POST" ] && mfmt="${RED}${BOLD}[POST]${R}" || mfmt="${GREEN_S}[GET] ${R}"
-                printf "  ${row_col}%-${COL_WL_HITS}s${R}  ${GREEN_S}%-${COL_WL_DOM}.${COL_WL_DOM}s${R}  ${CYAN_S}%-${COL_WL_IP}.${COL_WL_IP}s${R}  %b  ${GRAY}%s${R}\n" \
-                    "$hits" "$domain" "$ip" "$mfmt" "$ts"
+            }' "$WL_TMP" | sort -rn > "$AGG_TMP"
+
+            # ── Prefetch enrichment for every unique IP in the list ────────
+            while read -r _hits _dom ip _rest; do
+                [ -z "$ip" ] && continue
+                _ip_enrich "$ip" > /dev/null
+            done < "$AGG_TMP"
+
+            # ── Render rows ────────────────────────────────────────────────
+            head -10 "$AGG_TMP" | \
+            while read -r hits dom ip method status ts; do
+                [ -z "$ip" ] && continue
+                hits=$(( ${hits:-0} + 0 ))
+
+                # Enrichment — pure cache read, no API call
+                entry=$(grep "^${ip}|" "$ABUSEIPDB_CACHE" 2>/dev/null | head -1)
+                lscore=$(echo "$entry" | cut -d'|' -f2); lscore="${lscore:--}"
+                lcc=$(echo    "$entry" | cut -d'|' -f3); lcc="${lcc:---}"
+                lisp=$(echo   "$entry" | cut -d'|' -f4); lisp="${lisp:--}"
+                acol=$(_abuse_colour "$lscore")
+
+                # Is this IP active right now?
+                if grep -q "^[^ ]* ${ip} ${WL_CUR_MIN}\|^[^ ]* ${ip} ${WL_PREV_MIN}" "$WL_TMP" 2>/dev/null; then
+                    row_col="${RED}${BOLD}"
+                    active_marker="${RED}${BOLD}${BLINK}● LIVE${R}"
+                else
+                    row_col="${ORANGE}"
+                    active_marker="${DGRAY}──────${R}"
+                fi
+
+                # Method formatting
+                if [ "$method" = "POST" ]; then
+                    mfmt="${RED}${BOLD}POST   ${R}"
+                else
+                    mfmt="${GREEN_S}GET    ${R}"
+                fi
+
+                # Status code colour
+                case "${status:0:1}" in
+                    5) sfmt="${RED}${BOLD}${status}${R}" ;;
+                    4) sfmt="${ORANGE}${status}${R}" ;;
+                    3) sfmt="${YELLOW}${status}${R}" ;;
+                    *) sfmt="${GREEN_S}${status}${R}" ;;
+                esac
+
+                printf "  ${row_col}%-${COL_WL_HITS}s${R}  "              "$hits"
+                printf "${GRAY}%-${COL_WL_CC}s${R}  "                     "$lcc"
+                printf "${acol}%-${COL_WL_ABUSE}s${R}  "                  "$lscore"
+                printf "${CYAN_S}%-${COL_WL_IP}.${COL_WL_IP}s${R}  "     "$ip"
+                printf "${DIM}%-${COL_WL_ISP}.${COL_WL_ISP}s${R}  "      "$lisp"
+                printf "${GREEN_S}%-${COL_WL_DOM}.${COL_WL_DOM}s${R}  "   "$dom"
+                printf "%b  "                                               "$mfmt"
+                printf "%b  "                                               "$sfmt"
+                printf "${GRAY}%-${COL_WL_TS}s${R}  "                     "$ts"
+                printf "%b\n"                                               "$active_marker"
             done
+
+            rm -f "$AGG_TMP"
+
         else
             printf "  ${GREEN_S}No wp-login.php hits in access logs.${R}\n"
         fi
-    } > "$C2"
+
+        rm -f "$WL_TMP"
+    }> "$C2"
 
     render_two_cols "$C1" "$C2"
     rm -f "$C1" "$C2"
@@ -1736,79 +2045,8 @@ while true; do
         # refresh, before any while-read loop). Both loops below only
         # ever grep the cache file — zero additional API calls.
 
-        # ── IP enrichment — queries AbuseIPDB (score) + ip-api.com (geo/ISP) ──
-        #
-        # Cache file format:  ip|score|cc|isp
-        #   score  — AbuseIPDB confidence score 0-100, or "-" if no key / error
-        #   cc     — ISO country code e.g. "CN", "US", or "--"
-        #   isp    — ISP / org name from ip-api.com, or "-"
-        #
-        # ip-api.com is free, no key needed, 45 req/min limit.
-        # Both calls happen only once per unique IP per script run.
-        # All subsequent lookups are pure grep against the cache file.
-        _ip_enrich() {
-            local ip="$1"
-
-            # Return cached result immediately
-            local cached
-            cached=$(grep "^${ip}|" "$ABUSEIPDB_CACHE" 2>/dev/null | head -1)
-            if [ -n "$cached" ]; then
-                echo "$cached"; return
-            fi
-
-            # Skip RFC-1918 / loopback — not useful to query
-            local oct1 oct2
-            oct1=$(echo "$ip" | cut -d. -f1)
-            oct2=$(echo "$ip" | cut -d. -f2)
-            case "${oct1}.${oct2}" in
-                10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|192.168.*|127.*|0.*)
-                    echo "${ip}|-|--|−" >> "$ABUSEIPDB_CACHE"
-                    echo "${ip}|-|--|−"; return ;;
-            esac
-
-            # ── 1. AbuseIPDB — abuse confidence score ─────────────────────
-            local score="-"
-            if [ -n "$ABUSEIPDB_KEY" ]; then
-                local abuse_raw
-                abuse_raw=$(curl -sS --max-time 3 -G "https://api.abuseipdb.com/api/v2/check" \
-                    --data-urlencode "ipAddress=${ip}" \
-                    -d "maxAgeInDays=90" \
-                    -H "Key: ${ABUSEIPDB_KEY}" \
-                    -H "Accept: application/json" 2>/dev/null)
-                score=$(echo "$abuse_raw" | grep -oP '"abuseConfidenceScore"\s*:\s*\K[0-9]+')
-                score="${score:--}"
-            fi
-
-            # ── 2. ip-api.com — country code + ISP (free, no key needed) ──
-            local geo_raw cc isp
-            geo_raw=$(curl -sS --max-time 3 \
-                "http://ip-api.com/json/${ip}?fields=countryCode,isp,org" 2>/dev/null)
-            cc=$(echo  "$geo_raw" | grep -oP '"countryCode"\s*:\s*"\K[^"]+')
-            isp=$(echo "$geo_raw" | grep -oP '"isp"\s*:\s*"\K[^"]+')
-            # Fall back to org field if isp is empty
-            [ -z "$isp" ] && isp=$(echo "$geo_raw" | grep -oP '"org"\s*:\s*"\K[^"]+')
-            cc="${cc:---}"
-            isp="${isp:--}"
-            # Truncate ISP name to 24 chars so it fits the column
-            [ "${#isp}" -gt 24 ] && isp="${isp:0:23}…"
-
-            local result="${ip}|${score}|${cc}|${isp}"
-            echo "$result" >> "$ABUSEIPDB_CACHE"
-            echo "$result"
-        }
-
-        # Colour helper — safe to call from any subshell (read-only)
-        _abuse_colour() {
-            local score="$1"
-            if [[ "$score" =~ ^[0-9]+$ ]]; then
-                if   [ "$score" -ge 75 ]; then printf '%s' "${RED}${BOLD}"
-                elif [ "$score" -ge 25 ]; then printf '%s' "${ORANGE}"
-                else                           printf '%s' "${GREEN_S}"
-                fi
-            else
-                printf '%s' "${DGRAY}"
-            fi
-        }
+        # _ip_enrich and _abuse_colour are defined at top-level scope
+        # (before the main loop) so all blocks can call them freely.
 
         # ── Prefetch: resolve every unique IP before any while-read loop ──
         # This is the ONLY place curl is ever called. Subsequent lookups
@@ -1969,61 +2207,6 @@ while true; do
         fi
 
         rm -f "$NEW_LIVE_STATE"
-    }
-    hline '─' "$DGRAY"
-
-    # ════════════════════════════════════════════
-    #  BLOCK 6: MYSQL ACTIVE PROCESSES — FULL WIDTH
-    # ════════════════════════════════════════════
-    {
-        printf "${MAGENTA}${BOLD}  ▶  MYSQL ACTIVE PROCESSES${R}\n"
-        printf "  ${DGRAY}%-${COL_MYSQL_ID}s %-${COL_MYSQL_DB}s %-${COL_MYSQL_TIME}s %-${COL_MYSQL_STATE}s %s${R}\n" \
-            "ID" "DATABASE" "TIME" "STATE" "QUERY PREVIEW"
-        printf "  ${DGRAY}%-${COL_MYSQL_ID}s %-${COL_MYSQL_DB}s %-${COL_MYSQL_TIME}s %-${COL_MYSQL_STATE}s %s${R}\n" \
-            "────────" "──────────────────────" "──────" "────────────────" "$(printf '─%.0s' $(seq 1 $COL_MYSQL_QUERY))"
-
-        mysql_out=$(mysql --batch --silent -e "
-            SELECT
-                ID,
-                IFNULL(DB, 'system')    AS DB,
-                TIME,
-                IFNULL(STATE, '')       AS STATE,
-                IFNULL(INFO, '')        AS INFO
-            FROM information_schema.PROCESSLIST
-            WHERE COMMAND != 'Sleep'
-              AND INFO IS NOT NULL
-            ORDER BY TIME DESC
-            LIMIT 8;" 2>/dev/null)
-
-        if [ -z "$mysql_out" ]; then
-            printf "  ${GRAY}${DIM}(no active queries)${R}\n"
-        else
-            while IFS=$'\t' read -r id db time state query; do
-                [[ "$id" == "ID" ]] && continue
-                [ -z "$id" ]        && continue
-
-                time=$(( ${time:-0} + 0 ))
-                if [ "$time" -ge 5 ]; then
-                    tc="\033[38;5;196m"
-                else
-                    tc="\033[38;5;214m"
-                fi
-
-                printf "  \033[38;5;244m%-${COL_MYSQL_ID}s\033[0m" "$id"
-                printf " \033[38;5;82m%-${COL_MYSQL_DB}.${COL_MYSQL_DB}s\033[0m" "$db"
-                printf " ${tc}%-${COL_MYSQL_TIME}s\033[0m" "${time}s"
-                printf " \033[38;5;45m%-${COL_MYSQL_STATE}.${COL_MYSQL_STATE}s\033[0m\n" "$state"
-
-                clean_query=$(echo "$query" | tr '\n\t' '  ' | tr -s ' ')
-                echo "$clean_query" | fold -s -w "$COL_MYSQL_QUERY" | \
-                while IFS= read -r qline; do
-                    printf "  \033[38;5;240m│\033[0m \033[38;5;255m%s\033[0m\n" "$qline"
-                done
-
-                printf "  \033[38;5;237m%s\033[0m\n" \
-                    "$(printf '╌%.0s' $(seq 1 $(( TW - 4 ))))"
-            done <<< "$mysql_out"
-        fi
     }
     hline '─' "$DGRAY"
 
