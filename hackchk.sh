@@ -530,7 +530,7 @@ check_plugins() {
     fi
 
     local plugin_list
-    plugin_list=$(wp --allow-root plugin list \
+    plugin_list=$(wp --allow-root --skip-plugins plugin list \
         --path="$site_dir/public" \
         --format=csv \
         --fields=name,status,version \
