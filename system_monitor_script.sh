@@ -1,9 +1,12 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════
 #   SYSTEM MONITOR DASHBOARD — AI Prasul :-P
-#   v2.0 — for centminmod
+#   v3.0 — optimized for large-scale servers
 # ═══════════════════════════════════════════════
 
+set -o pipefail
+
+# ── ANSI CODES ────────────────────────────────
 R="\033[0m"
 BOLD="\033[1m"
 DIM="\033[2m"
@@ -25,123 +28,106 @@ BG_HEADER="\033[48;5;18m"
 BG_ALERT="\033[48;5;52m"
 BLINK="\033[5m"
 
+# ── CONFIG ────────────────────────────────────
 ACCESSLOG_PATH="/home/nginx/domains/*/log/access.log"
 ERRORLOG_PATH="/home/nginx/domains/*/log/error.log"
 SLOWLOG="/var/log/php-fpm/www-slow.log"
-IP_STATE_FILE="/tmp/ip_counts.state"
-touch "$IP_STATE_FILE"
-FILE_CACHE="/tmp/recent_file_changes.cache"
-FILE_SCAN_TS="/tmp/last_file_scan.ts"
-[ -f "$FILE_SCAN_TS" ] || echo 0 > "$FILE_SCAN_TS"
-SCAN_INTERVAL=900
-ERRLOG_STATE="/tmp/nginx_error_counts.state"
-touch "$ERRLOG_STATE"
-MYSQL_QPS_STATE="/tmp/mysql_qps.state"
-touch "$MYSQL_QPS_STATE"
 PHPFPM_STATUS_URL="http://127.0.0.1/status"
 
+# How many lines to tail from each access log per refresh.
+# 50k lines ≈ last ~10 minutes on a busy site. Covers "all-time in window"
+# without scanning GB of history. Increase if you need deeper lookback.
+LOG_TAIL_LINES=50000
+
+# How many lines to tail for "current minute" live view
+LIVE_TAIL_LINES=2000
+
+# Refresh interval in seconds
+REFRESH_INTERVAL=20
+
+# State files (persist across refreshes)
+IP_STATE_FILE="/tmp/monitor_ip_counts.state"
+FILE_CACHE="/tmp/recent_file_changes.cache"
+FILE_SCAN_TS="/tmp/last_file_scan.ts"
+SCAN_INTERVAL=900
+ERRLOG_STATE="/tmp/nginx_error_counts.state"
+MYSQL_QPS_STATE="/tmp/mysql_qps.state"
+MYSQL_QPS_TS="/tmp/mysql_qps_ts.state"
+LIVE_URL_STATE="/tmp/live_url_ip.state"
+LIVE_VEL_STATE="/tmp/live_vel_domip.state"
+
+# AbuseIPDB
 ABUSEIPDB_KEY="${ABUSEIPDB_KEY:-}"
-ABUSEIPDB_CACHE="/tmp/.ipcache_${$}"
-touch "$ABUSEIPDB_CACHE" && chmod 600 "$ABUSEIPDB_CACHE"
+ABUSEIPDB_CACHE="/tmp/.monitor_ipcache"
 
-# ══════════════════════════════════════════════════════
-#  LAYOUT CONFIG — all column math in one place
-#  Change numbers here and everything adjusts globally
-# ══════════════════════════════════════════════════════
-TW=$(tput cols 2>/dev/null || echo 120)
-HALF=$(( TW / 2 - 1 ))
+# WP-Login exclusion list (space-separated IPs)
+WL_EXCLUDE_IPS="${WL_EXCLUDE_IPS:-}"
 
-# Two-column layout widths (must fit inside HALF)
-COL_PROC_N=4       # process rank number
-COL_PROC_NAME=26   # process name
-COL_PROC_PCT=6     # cpu/mem %
+# HTML report config
+REPORT_WEBROOT="/usr/local/nginx/html"
+REPORT_SUBDIR="reports"
+REPORT_BASE_URL=""
+REPORT_ENDPOINT=""
+REPORT_TOKEN="changeme123"
 
-COL_NET_STATE=24   # network state
-COL_NET_COUNT=6    # connection count
+# ── INIT STATE FILES ─────────────────────────
+for f in "$IP_STATE_FILE" "$ERRLOG_STATE" "$MYSQL_QPS_STATE" "$ABUSEIPDB_CACHE"; do
+    [ -f "$f" ] || touch "$f"
+done
+chmod 600 "$ABUSEIPDB_CACHE" 2>/dev/null
+[ -f "$FILE_SCAN_TS" ] || echo 0 > "$FILE_SCAN_TS"
+[ -f "$MYSQL_QPS_TS" ]  || echo 0 > "$MYSQL_QPS_TS"
 
-COL_IP_HITS=10     # ip hit count
-COL_IP_ADDR=28     # ip address
-COL_IP_DELTA=8     # delta indicator
+# ══════════════════════════════════════════════════
+#  LAYOUT ENGINE — adapts to terminal width
+# ══════════════════════════════════════════════════
+_recalc_layout() {
+    TW=$(tput cols 2>/dev/null || echo 120)
+    [ "$TW" -lt 80 ] && TW=80
+    HALF=$(( TW / 2 - 2 ))
 
-COL_URL_HITS=8     # url hit count
-COL_URL_DOM=22     # domain
-COL_URL_PATH=28    # url path
+    # Ensure HALF is at least usable
+    [ "$HALF" -lt 40 ] && HALF=40
 
-COL_WL_HITS=6      # wp-login hits
-COL_WL_DOM=22      # domain
-COL_WL_IP=26       # ip
-COL_WL_METHOD=8    # method
-COL_WL_TIME=14     # timestamp
+    # Dynamic column for full-width blocks
+    COL_MYSQL_QUERY=$(( TW - 62 ))
+    [ "$COL_MYSQL_QUERY" -lt 40 ] && COL_MYSQL_QUERY=40
 
-COL_SLOW_COUNT=8   # slowlog count
-COL_SLOW_DOM=26    # domain
-COL_SLOW_PLUGIN=22 # plugin name
+    COL_LV_URL=$(( TW - 112 ))
+    [ "$COL_LV_URL" -lt 20 ] && COL_LV_URL=20
 
-COL_VEL_HITS=6     # velocity hits
-COL_VEL_DOM=22     # domain
-COL_VEL_IP=28      # ip
-COL_VEL_STATUS=8   # status
+    COL_ERR_SNIPPET=$(( TW - 96 ))
+    [ "$COL_ERR_SNIPPET" -lt 24 ] && COL_ERR_SNIPPET=24
+}
+_recalc_layout
 
-COL_FC_DOM=20      # file change domain
-COL_FC_TYPE=7      # plugin/theme label
-COL_FC_COUNT=6     # number of files changed
-COL_FC_PLUGIN=28   # plugin or theme folder name
-# last modified (most recent) gets the remainder
+# ── Precomputed horizontal rule (avoids seq/loop per call) ──
+_hline_cache=""
+_hline_cache_w=0
 
-# Nginx error log columns (full-width block)
-COL_ERR_DOM=22     # domain name
-COL_ERR_TIME=20    # timestamp of latest entry
-COL_ERR_DELTA=6    # +N new errors since last refresh
-COL_ERR_CLIENT=18  # client IP
-COL_ERR_REQ=24     # request path
-# snippet (error message) gets the remainder
-
-# PHP-FPM pool columns (two-column block, left side)
-COL_FPM_POOL=20    # pool name
-COL_FPM_ACT=7      # active workers
-COL_FPM_IDLE=6     # idle workers
-COL_FPM_MAX=6      # max children
-COL_FPM_QUEUE=7    # queue depth
-COL_FPM_STATUS=12  # status label
-
-# MySQL health columns (two-column block, right side)
-COL_MH_LABEL=18    # metric label
-COL_MH_VAL=14      # metric value
-
-# Disk I/O columns (full-width block)
-COL_IO_DEV=10      # device name
-COL_IO_READ=10     # read KB/s
-COL_IO_WRITE=10    # write KB/s
-COL_IO_AWAIT=12    # await ms
-COL_IO_UTIL=8      # utilisation %
-
-# MySQL full-width query wrap (full width minus indent and border char)
-COL_MYSQL_ID=8
-COL_MYSQL_DB=22
-COL_MYSQL_TIME=6
-COL_MYSQL_STATE=16
-COL_MYSQL_QUERY=$(( TW - COL_MYSQL_ID - COL_MYSQL_DB - COL_MYSQL_TIME - COL_MYSQL_STATE - 10 ))
-[ "$COL_MYSQL_QUERY" -lt 40 ] && COL_MYSQL_QUERY=40
-
-# ── Full-width line ───────────────────────────────
+# ── Safe integer coercion (strips non-digits, returns 0 for garbage) ──
+to_int() {
+    local v="${1//[!0-9]/}"
+    echo "${v:-0}"
+}
 hline() {
     local char="${1:- }" color="${2:-$DGRAY}"
-    local line=""
-    for ((i=0; i<TW; i++)); do line+="$char"; done
-    printf "${color}%s${R}\n" "$line"
+    if [ "$_hline_cache_w" -ne "$TW" ] || [ "${_hline_cache_char:-}" != "$char" ]; then
+        _hline_cache=$(printf "%${TW}s" "" | tr ' ' "$char")
+        _hline_cache_w=$TW
+        _hline_cache_char="$char"
+    fi
+    printf "${color}%s${R}\n" "$_hline_cache"
 }
 
-# ── Column divider character ──────────────────────
 VBAR="${DGRAY}|${R}"
 
-# ── Color a percentage value (integer-safe) ───────
+# ── Color a percentage (integer-safe, no subshell) ──
 color_pct() {
-    local raw="${1:-0}"
-    local hi="${2:-50}" med="${3:-20}"
-    # Strip decimal part safely
-    local val
-    val=$(echo "$raw" | tr -d '[:space:]' | sed 's/\..*//')
-    [[ "$val" =~ ^-?[0-9]+$ ]] || val=0
+    local raw="${1:-0}" hi="${2:-50}" med="${3:-20}"
+    local val="${raw%%.*}"
+    val="${val//[^0-9-]/}"
+    [ -z "$val" ] && val=0
     if   [ "$val" -ge "$hi"  ]; then printf "${RED}${BOLD}"
     elif [ "$val" -ge "$med" ]; then printf "${ORANGE}"
     else printf "${GREEN_S}"
@@ -149,25 +135,21 @@ color_pct() {
 }
 
 # ══════════════════════════════════════════════════
-# render_two_cols FILE_LEFT FILE_RIGHT
-#   Merges two files side-by-side, ANSI-aware padding.
-#   FIX: broadened ANSI strip regex to cover all
-#        escape sequences, not just SGR 'm' ones.
+# render_two_cols — ANSI+UTF-8 aware side-by-side
 # ══════════════════════════════════════════════════
 render_two_cols() {
-    local left="$1" right="$2"
-    local col_w="$HALF"
+    local left="$1" right="$2" col_w="$HALF"
 
-    awk -v col="$col_w" '
-    function strip(s,    r) {
+    LC_ALL=C awk -v col="$col_w" '
+    function visible_len(s,    r) {
         r = s
-        while (match(r, /\033\[[0-9;]*[A-Za-z]/)) {
+        # Strip all ANSI escape sequences
+        while (match(r, /\033\[[0-9;]*[A-Za-z]/))
             r = substr(r,1,RSTART-1) substr(r,RSTART+RLENGTH)
-        }
-        return r
+        return length(r)
     }
     function pad_to(s, w,    pl, spaces) {
-        pl = length(strip(s))
+        pl = visible_len(s)
         spaces = w - pl
         if (spaces < 0) spaces = 0
         return s sprintf("%" spaces "s", "")
@@ -186,205 +168,186 @@ render_two_cols() {
     ' "$left" "$right"
 }
 
-# ════════════════════════════════════════════════
-#  EXIT REPORT
-# ════════════════════════════════════════════════
-generate_report() {
-    local RPT="/tmp/monitor_report_$(date '+%Y%m%d_%H%M%S').txt"
-    local NOW_FULL=$(date "+%A, %d %b %Y  %H:%M:%S")
-    local HOST=$(hostname -s 2>/dev/null || echo "server")
-    local LOAD=$(uptime | awk -F'load average:' '{print $2}' | xargs)
-    local UPTIME_S=$(uptime -p 2>/dev/null | sed 's/up //')
+# ══════════════════════════════════════════════════
+#  SINGLE-PASS LOG EXTRACTION
+#  This is the core performance optimization.
+#  Instead of scanning each log 4-6 times, we do ONE
+#  tail + awk pass and produce all aggregates at once.
+# ══════════════════════════════════════════════════
+#
+# Output files (written atomically via temp+mv):
+#   /tmp/mon_top_ips.dat      — "count ip" sorted desc
+#   /tmp/mon_top_urls.dat     — "count domain url" sorted desc
+#   /tmp/mon_live_traffic.dat — "domain ip method url status" (current minute)
+#   /tmp/mon_wplogin.dat      — "domain ip ts method status" (wp-login only)
+#
+# This replaces ~12 separate pipelines from v2.
 
-    {
-    echo "════════════════════════════════════════════════════════════════"
-    echo "  SERVER PERFORMANCE REPORT"
-    echo "  Generated : ${NOW_FULL}"
-    echo "  Host      : ${HOST}"
-    echo "  Uptime    : ${UPTIME_S}"
-    echo "  Load avg  : ${LOAD}"
-    echo "════════════════════════════════════════════════════════════════"
-    echo ""
+extract_logs() {
+    local cur_min="$1"
+    local tmp_ips=$(mktemp)
+    local tmp_urls=$(mktemp)
+    local tmp_live=$(mktemp)
+    local tmp_wplogin=$(mktemp)
 
-    echo "┌─────────────────────────────────────────────────────────────"
-    echo "│  TOP CPU-CONSUMING PROCESSES"
-    echo "├─────────────────────────────────────────────────────────────"
-    ps -eo comm,%cpu --sort=-%cpu 2>/dev/null | awk 'NR>1&&NR<=6{
-        printf "│  %-3d  %-36s  %s%%\n", NR-1, $1, $2}'
-    echo "└─────────────────────────────────────────────────────────────"
-    echo ""
-
-    echo "┌─────────────────────────────────────────────────────────────"
-    echo "│  TOP MEMORY-CONSUMING PROCESSES"
-    echo "├─────────────────────────────────────────────────────────────"
-    ps -eo comm,%mem --sort=-%mem 2>/dev/null | awk 'NR>1&&NR<=6{
-        printf "│  %-3d  %-36s  %s%%\n", NR-1, $1, $2}'
-    echo "└─────────────────────────────────────────────────────────────"
-    echo ""
-
-    echo "┌─────────────────────────────────────────────────────────────"
-    echo "│  TOP URLs BY HIT COUNT  (from access logs)"
-    echo "├─────────────────────────────────────────────────────────────"
-    local url_tmp=$(mktemp)
     for logfile in $ACCESSLOG_PATH; do
         [ -f "$logfile" ] || continue
-        domain=$(echo "$logfile" | awk -F'/' '{print $5}')
-        awk -v dom="$domain" '{print dom, $7}' "$logfile" 2>/dev/null
-    done | sort | uniq -c | sort -nr | head -10 > "$url_tmp"
-    awk '{printf "│  %-8s  %-28s  %s\n", $1, $2, $3}' "$url_tmp"
-    rm -f "$url_tmp"
-    echo "└─────────────────────────────────────────────────────────────"
-    echo ""
+        local domain
+        domain=$(echo "$logfile" | cut -d'/' -f5)
 
-    echo "┌─────────────────────────────────────────────────────────────"
-    echo "│  TOP IPs HITTING THE SERVER  (from access logs)"
-    echo "├─────────────────────────────────────────────────────────────"
-    for log in $ACCESSLOG_PATH; do
-        [ -f "$log" ] && awk '{print $1}' "$log"
-    done 2>/dev/null | sort | uniq -c | sort -nr | head -10 | \
-        awk '{printf "│  %-8s  %s\n", $1, $2}'
-    echo "└─────────────────────────────────────────────────────────────"
-    echo ""
+        # Single awk pass extracts everything we need
+        tail -n "$LOG_TAIL_LINES" "$logfile" 2>/dev/null | \
+        awk -v dom="$domain" -v cm="$cur_min" \
+            -v f_ips="/dev/fd/3" \
+            -v f_urls="/dev/fd/4" \
+            -v f_live="/dev/fd/5" \
+            -v f_wpl="/dev/fd/6" '
+        {
+            ip = $1
+            url = $7
+            ts = $4; sub(/^\[/, "", ts)
+            method = $6; gsub(/"/, "", method)
+            status = $9
 
-    echo "┌─────────────────────────────────────────────────────────────"
-    echo "│  TOP URLs THIS MINUTE  (live window)"
-    echo "├─────────────────────────────────────────────────────────────"
-    local CUR_MIN=$(date "+%d/%b/%Y:%H:%M")
-    local live_tmp=$(mktemp)
-    for log in $ACCESSLOG_PATH; do
-        [ -f "$log" ] || continue
-        dom=$(echo "$log" | awk -F'/' '{print $5}')
-        tail -n 500 "$log" | grep "$CUR_MIN" | \
-            awk -v d="$dom" '{print d, $1, $7}' >> "$live_tmp"
-    done
-    if [ -s "$live_tmp" ]; then
-        sort "$live_tmp" | uniq -c | sort -nr | head -10 | \
-            awk '{printf "│  %-6s hits  %-28s  %-18s  %s\n", $1, $2, $3, $4}'
-    else
-        echo "│  (no traffic in current minute)"
-    fi
-    rm -f "$live_tmp"
-    echo "└─────────────────────────────────────────────────────────────"
-    echo ""
+            # Accumulate IPs
+            ip_count[ip]++
 
-    echo "┌─────────────────────────────────────────────────────────────"
-    echo "│  TOP 3 IPs THIS MINUTE  (live window)"
-    echo "├─────────────────────────────────────────────────────────────"
-    local live_ip_tmp=$(mktemp)
-    for log in $ACCESSLOG_PATH; do
-        [ -f "$log" ] || continue
-        dom=$(echo "$log" | awk -F'/' '{print $5}')
-        tail -n 500 "$log" | grep "$CUR_MIN" | \
-            awk -v d="$dom" '{print d, $1}' >> "$live_ip_tmp"
-    done
-    if [ -s "$live_ip_tmp" ]; then
-        sort "$live_ip_tmp" | uniq -c | sort -nr | head -3 | \
-            awk '{printf "│  %-6s hits  %-28s  %s\n", $1, $2, $3}'
-    else
-        echo "│  (no traffic in current minute)"
-    fi
-    rm -f "$live_ip_tmp"
-    echo "└─────────────────────────────────────────────────────────────"
-    echo ""
+            # Accumulate URLs
+            url_key = dom " " url
+            url_count[url_key]++
 
-    echo "┌─────────────────────────────────────────────────────────────"
-    echo "│  PHP SLOWLOG — TOP OFFENDING PLUGIN + MOST COMMON CALL STACK"
-    echo "├─────────────────────────────────────────────────────────────"
-    if [ -f "$SLOWLOG" ]; then
-        TOP_PLUGIN=$(grep "wp-content/plugins/" "$SLOWLOG" | \
-            sed -rn 's/.*\/plugins\/([^/ ]+).*/\1/p' | \
-            sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
-
-        if [ -n "$TOP_PLUGIN" ]; then
-            TOP_COUNT=$(grep -c "$TOP_PLUGIN" "$SLOWLOG" | tr -d '[:space:]')
-            TOP_DOM=$(grep "wp-content/plugins/$TOP_PLUGIN" "$SLOWLOG" | \
-                sed -rn 's/.*\/domains\/([^/]+)\/.*/\1/p' | \
-                sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
-
-            echo "│"
-            printf "│  Plugin      : %s\n"  "$TOP_PLUGIN"
-            printf "│  Domain      : %s\n"  "${TOP_DOM:-unknown}"
-            printf "│  Slow entries: %s\n"  "$TOP_COUNT"
-            echo "│"
-            echo "│  Most frequently occurring stack frames:"
-            echo "│  ──────────────────────────────────────────────────────────────"
-
-            awk -v plugin="$TOP_PLUGIN" '
-            BEGIN { has_plugin = 0; nframes = 0 }
-            /^# Time:/ {
-                if (has_plugin) { for (i = 0; i < nframes; i++) print frames[i] }
-                has_plugin = 0; nframes = 0; next
+            # Live traffic (current minute)
+            if (index(ts, cm) == 1) {
+                print dom, ip, method, url, status > f_live
             }
-            /^\[0x/ {
-                line = $0
-                sub(/^\[0x[0-9a-fA-F]+\] /, "", line)
-                sub(/\/home\/nginx\/domains\/[^\/]*\/public\//, "", line)
-                frames[nframes++] = line
-                if (line ~ plugin) has_plugin = 1
-                next
+
+            # WP-Login
+            if (url ~ /wp-login\.php/) {
+                print dom, ip, ts, method, status > f_wpl
             }
-            END { if (has_plugin) for (i = 0; i < nframes; i++) print frames[i] }
-            ' "$SLOWLOG" | \
-            sort | uniq -c | sort -rn | head -20 | \
-            while IFS= read -r ranked_line; do
-                count=$(echo "$ranked_line" | awk '{print $1}')
-                frame=$(echo "$ranked_line" | cut -d' ' -f2-)
-                printf "│  [%3dx]  %s\n" "$count" "$frame"
-            done
+        }
+        END {
+            for (ip in ip_count) print ip_count[ip], ip > f_ips
+            for (uk in url_count) print url_count[uk], uk > f_urls
+        }
+        ' 3>>"$tmp_ips" 4>>"$tmp_urls" 5>>"$tmp_live" 6>>"$tmp_wplogin"
+    done
 
-            echo "│"
-            echo "│  Note: [Nx] = times this frame appeared across all slow entries"
-        else
-            echo "│  (no plugin entries found in slowlog)"
-        fi
-    else
-        echo "│  (slowlog not found at: $SLOWLOG)"
-    fi
-    echo "└─────────────────────────────────────────────────────────────"
-    echo ""
+    # Sort and write final outputs atomically
+    sort -rn "$tmp_ips"     | head -20 > /tmp/mon_top_ips.dat.new
+    sort -rn "$tmp_urls"    | head -20 > /tmp/mon_top_urls.dat.new
+    cat "$tmp_live"                    > /tmp/mon_live_traffic.dat.new
+    cat "$tmp_wplogin"                 > /tmp/mon_wplogin.dat.new
 
-    echo "┌─────────────────────────────────────────────────────────────"
-    echo "│  WP-LOGIN.PHP ACTIVITY"
-    echo "├─────────────────────────────────────────────────────────────"
-    local wl_total=0
-    for log in $ACCESSLOG_PATH; do
-        [ -f "$log" ] && grep -c "wp-login.php" "$log" 2>/dev/null || echo 0
-    done | awk '{s+=$1} END{print s+0}' | read wl_total
-    wl_total=$(( ${wl_total:-0} + 0 ))
-    if [ "$wl_total" -gt 0 ]; then
-        echo "│  ⚠  Total wp-login.php hits in logs: $wl_total"
-        echo "│"
-        echo "│  Top offending IPs:"
-        for log in $ACCESSLOG_PATH; do
-            [ -f "$log" ] && grep "wp-login.php" "$log"
-        done 2>/dev/null | \
-            awk '{print $1}' | sort | uniq -c | sort -nr | head -5 | \
-            awk '{printf "│    %-8s  %s\n", $1, $2}'
-    else
-        echo "│  ✔  No wp-login.php hits detected"
-    fi
-    echo "└─────────────────────────────────────────────────────────────"
-    echo ""
+    mv /tmp/mon_top_ips.dat.new      /tmp/mon_top_ips.dat
+    mv /tmp/mon_top_urls.dat.new     /tmp/mon_top_urls.dat
+    mv /tmp/mon_live_traffic.dat.new /tmp/mon_live_traffic.dat
+    mv /tmp/mon_wplogin.dat.new      /tmp/mon_wplogin.dat
 
-    echo "════════════════════════════════════════════════════════════════"
-    echo "  End of report  •  $(date '+%H:%M:%S')"
-    echo "════════════════════════════════════════════════════════════════"
-
-    } | tee "$RPT"
-
-    echo ""
-    echo "  Report saved to: $RPT"
+    rm -f "$tmp_ips" "$tmp_urls" "$tmp_live" "$tmp_wplogin"
 }
 
-# ════════════════════════════════════════════════
-#  HTML REPORT
-# ════════════════════════════════════════════════
-REPORT_WEBROOT="/usr/local/nginx/html"
-REPORT_SUBDIR="reports"
-REPORT_BASE_URL=""
-REPORT_ENDPOINT=""
-REPORT_TOKEN="changeme123"
+# ══════════════════════════════════════════════════
+#  IP ENRICHMENT (AbuseIPDB + ip-api.com)
+#  Cache is stable across refreshes (not PID-based)
+# ══════════════════════════════════════════════════
 
+# Load cache into an associative array for O(1) lookups
+# (replaces grep-per-IP which was O(n) per lookup)
+declare -A IP_CACHE
+
+_load_ip_cache() {
+    IP_CACHE=()
+    while IFS='|' read -r ip score cc isp _; do
+        [ -z "$ip" ] && continue
+        IP_CACHE["$ip"]="${score}|${cc}|${isp}"
+    done < "$ABUSEIPDB_CACHE" 2>/dev/null
+}
+
+_ip_enrich() {
+    local ip="$1"
+
+    # Check in-memory cache first
+    if [ -n "${IP_CACHE[$ip]+x}" ]; then
+        echo "${ip}|${IP_CACHE[$ip]}"
+        return
+    fi
+
+    # Skip private ranges
+    case "$ip" in
+        10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|192.168.*|127.*|0.*)
+            IP_CACHE["$ip"]="-|--|private"
+            echo "${ip}|-|--|private" >> "$ABUSEIPDB_CACHE"
+            echo "${ip}|-|--|private"
+            return ;;
+    esac
+
+    # AbuseIPDB lookup
+    local score="-"
+    if [ -n "$ABUSEIPDB_KEY" ]; then
+        local abuse_raw
+        abuse_raw=$(curl -sS --max-time 3 -G "https://api.abuseipdb.com/api/v2/check" \
+            --data-urlencode "ipAddress=${ip}" \
+            -d "maxAgeInDays=90" \
+            -H "Key: ${ABUSEIPDB_KEY}" \
+            -H "Accept: application/json" 2>/dev/null)
+        local s
+        s=$(echo "$abuse_raw" | grep -oP '"abuseConfidenceScore"\s*:\s*\K[0-9]+')
+        score="${s:--}"
+    fi
+
+    # Geo lookup (ip-api.com free tier — HTTP only)
+    local geo_raw cc isp
+    geo_raw=$(curl -sS --max-time 3 \
+        "http://ip-api.com/json/${ip}?fields=countryCode,isp,org" 2>/dev/null)
+    cc=$(echo "$geo_raw"  | grep -oP '"countryCode"\s*:\s*"\K[^"]+')
+    isp=$(echo "$geo_raw" | grep -oP '"isp"\s*:\s*"\K[^"]+')
+    [ -z "$isp" ] && isp=$(echo "$geo_raw" | grep -oP '"org"\s*:\s*"\K[^"]+')
+    cc="${cc:---}"
+    isp="${isp:--}"
+    [ "${#isp}" -gt 24 ] && isp="${isp:0:23}…"
+
+    local result="${ip}|${score}|${cc}|${isp}"
+    IP_CACHE["$ip"]="${score}|${cc}|${isp}"
+    echo "$result" >> "$ABUSEIPDB_CACHE"
+    echo "$result"
+}
+
+_ip_get_cached() {
+    # Fast path: in-memory only, no fallback
+    local ip="$1"
+    if [ -n "${IP_CACHE[$ip]+x}" ]; then
+        echo "${IP_CACHE[$ip]}"
+    else
+        echo "-|--|—"
+    fi
+}
+
+_abuse_colour() {
+    local score="$1"
+    if [[ "$score" =~ ^[0-9]+$ ]]; then
+        if   [ "$score" -ge 75 ]; then printf '%s' "${RED}${BOLD}"
+        elif [ "$score" -ge 25 ]; then printf '%s' "${ORANGE}"
+        else                           printf '%s' "${GREEN_S}"
+        fi
+    else
+        printf '%s' "${DGRAY}"
+    fi
+}
+
+# Bulk-enrich a list of IPs (one per line). Call once before rendering.
+_enrich_ips_bulk() {
+    local ip_file="$1"
+    while read -r ip; do
+        [ -z "$ip" ] && continue
+        [ -n "${IP_CACHE[$ip]+x}" ] && continue
+        _ip_enrich "$ip" > /dev/null
+    done < "$ip_file"
+}
+
+# ══════════════════════════════════════════════════
+#  HTML HELPERS
+# ══════════════════════════════════════════════════
 html_e() { printf '%s' "$1" | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g;s/"/\&quot;/g'; }
 
 json_str() {
@@ -395,14 +358,114 @@ json_str() {
         -e ':a;N;$!ba;s/\n/\\n/g'
 }
 
+# ══════════════════════════════════════════════════
+#  PLAIN-TEXT EXIT REPORT
+# ══════════════════════════════════════════════════
+generate_report() {
+    local RPT="/tmp/monitor_report_$(date '+%Y%m%d_%H%M%S').txt"
+    local NOW_FULL HOST LOAD UPTIME_S
+    NOW_FULL=$(date "+%A, %d %b %Y  %H:%M:%S")
+    HOST=$(hostname -s 2>/dev/null || echo "server")
+    LOAD=$(uptime | awk -F'load average:' '{print $2}' | xargs)
+    UPTIME_S=$(uptime -p 2>/dev/null | sed 's/up //')
+
+    {
+    cat <<-EOF
+	════════════════════════════════════════════════════════════════
+	  SERVER PERFORMANCE REPORT
+	  Generated : ${NOW_FULL}
+	  Host      : ${HOST}
+	  Uptime    : ${UPTIME_S}
+	  Load avg  : ${LOAD}
+	════════════════════════════════════════════════════════════════
+
+	EOF
+
+    echo "┌─── TOP CPU-CONSUMING PROCESSES ────────────────────────────"
+    ps -eo comm,%cpu --sort=-%cpu 2>/dev/null | awk 'NR>1&&NR<=6{
+        printf "│  %-3d  %-36s  %s%%\n", NR-1, $1, $2}'
+    echo "└─────────────────────────────────────────────────────────────"
+    echo ""
+
+    echo "┌─── TOP MEMORY-CONSUMING PROCESSES ─────────────────────────"
+    ps -eo comm,%mem --sort=-%mem 2>/dev/null | awk 'NR>1&&NR<=6{
+        printf "│  %-3d  %-36s  %s%%\n", NR-1, $1, $2}'
+    echo "└─────────────────────────────────────────────────────────────"
+    echo ""
+
+    echo "┌─── TOP URLs BY HIT COUNT ─────────────────────────────────"
+    if [ -f /tmp/mon_top_urls.dat ]; then
+        head -10 /tmp/mon_top_urls.dat | awk '{printf "│  %-8s  %-28s  %s\n", $1, $2, $3}'
+    fi
+    echo "└─────────────────────────────────────────────────────────────"
+    echo ""
+
+    echo "┌─── TOP IPs HITTING THE SERVER ────────────────────────────"
+    if [ -f /tmp/mon_top_ips.dat ]; then
+        head -10 /tmp/mon_top_ips.dat | awk '{printf "│  %-8s  %s\n", $1, $2}'
+    fi
+    echo "└─────────────────────────────────────────────────────────────"
+    echo ""
+
+    echo "┌─── WP-LOGIN.PHP ACTIVITY ────────────────────────────────"
+    local wl_total=0
+    [ -f /tmp/mon_wplogin.dat ] && wl_total=$(wc -l < /tmp/mon_wplogin.dat | tr -d '[:space:]')
+    wl_total=$(to_int "$wl_total")
+    if [ "$wl_total" -gt 0 ]; then
+        echo "│  Total wp-login.php hits in log window: $wl_total"
+        echo "│  Top offending IPs:"
+        awk '{print $2}' /tmp/mon_wplogin.dat | sort | uniq -c | sort -nr | head -5 | \
+            awk '{printf "│    %-8s  %s\n", $1, $2}'
+    else
+        echo "│  No wp-login.php hits detected"
+    fi
+    echo "└─────────────────────────────────────────────────────────────"
+    echo ""
+
+    # PHP Slowlog summary
+    echo "┌─── PHP SLOWLOG — TOP OFFENDING PLUGIN ───────────────────"
+    if [ -f "$SLOWLOG" ]; then
+        local TOP_PLUGIN
+        TOP_PLUGIN=$(grep "wp-content/plugins/" "$SLOWLOG" | \
+            sed -rn 's/.*\/plugins\/([^/ ]+).*/\1/p' | \
+            sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+        if [ -n "$TOP_PLUGIN" ]; then
+            local TOP_COUNT TOP_DOM
+            TOP_COUNT=$(grep -c "$TOP_PLUGIN" "$SLOWLOG" 2>/dev/null | tr -d '[:space:]')
+            TOP_DOM=$(grep "wp-content/plugins/$TOP_PLUGIN" "$SLOWLOG" | \
+                sed -rn 's/.*\/domains\/([^/]+)\/.*/\1/p' | \
+                sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+            printf "│  Plugin: %-20s  Domain: %-20s  Entries: %s\n" \
+                "$TOP_PLUGIN" "${TOP_DOM:-unknown}" "$TOP_COUNT"
+        else
+            echo "│  (no plugin entries found)"
+        fi
+    else
+        echo "│  (slowlog not found)"
+    fi
+    echo "└─────────────────────────────────────────────────────────────"
+
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "  End of report  •  $(date '+%H:%M:%S')"
+    echo "════════════════════════════════════════════════════════════════"
+
+    } | tee "$RPT"
+    echo ""
+    echo "  Report saved to: $RPT"
+}
+
+# ══════════════════════════════════════════════════
+#  HTML REPORT (generates on Ctrl+C)
+# ══════════════════════════════════════════════════
 generate_html_report() {
-    local NOW_FULL=$(date "+%A, %d %b %Y  %H:%M:%S")
-    local NOW_SLUG=$(date '+%Y-%m-%d_%H-%M-%S')
-    local HOST_FULL=$(hostname -f 2>/dev/null || hostname -s 2>/dev/null || echo "server")
-    local HOST_SHORT=$(hostname -s 2>/dev/null || echo "server")
-    local LOAD=$(uptime | awk -F'load average:' '{print $2}' | xargs)
-    local UPTIME_S=$(uptime -p 2>/dev/null | sed 's/up //')
-    local CUR_MIN=$(date "+%d/%b/%Y:%H:%M")
+    local NOW_FULL NOW_SLUG HOST_FULL HOST_SHORT LOAD UPTIME_S
+    NOW_FULL=$(date "+%A, %d %b %Y  %H:%M:%S")
+    NOW_SLUG=$(date '+%Y-%m-%d_%H-%M-%S')
+    HOST_FULL=$(hostname -f 2>/dev/null || hostname -s 2>/dev/null || echo "server")
+    HOST_SHORT=$(hostname -s 2>/dev/null || echo "server")
+    LOAD=$(uptime | awk -F'load average:' '{print $2}' | xargs)
+    UPTIME_S=$(uptime -p 2>/dev/null | sed 's/up //')
 
     local PUB_DIR="$REPORT_WEBROOT"
     [ -n "$REPORT_SUBDIR" ] && PUB_DIR="${REPORT_WEBROOT}/${REPORT_SUBDIR}"
@@ -412,176 +475,69 @@ generate_html_report() {
 
     local REPORT_URL="${PUBLIC_BASE}/${REPORT_SUBDIR}/${NOW_SLUG}.html"
     [ -z "$REPORT_SUBDIR" ] && REPORT_URL="${PUBLIC_BASE}/${NOW_SLUG}.html"
-    local LATEST_URL="${PUBLIC_BASE}/report.html"
-    local INDEX_URL="${PUBLIC_BASE}/${REPORT_SUBDIR}/"
-    [ -z "$REPORT_SUBDIR" ] && INDEX_URL="${PUBLIC_BASE}/"
 
     if [ ! -d "$REPORT_WEBROOT" ]; then
         PUB_DIR="/tmp/monitor_reports"
-        echo "  ⚠  Web root not found ($REPORT_WEBROOT), writing to $PUB_DIR"
+        echo "  Warning: Web root not found ($REPORT_WEBROOT), writing to $PUB_DIR"
     fi
-
     mkdir -p "$PUB_DIR" 2>/dev/null
 
     local HTML_FILE="${PUB_DIR}/${NOW_SLUG}.html"
-    local LATEST_LINK="${REPORT_WEBROOT}/report.html"
 
-    # CPU
+    # ── Build data rows from cached extraction files ──
+    # CPU rows
     local cpu_rows=""
     while read -r proc pct; do
-        local bar_w=$(echo "$pct" | awk '{v=int($1*2); if(v>100)v=100; print v}')
-        local col; col=$(awk -v p="$pct" 'BEGIN{if(p+0>=50)print "#c92a2a"; else if(p+0>=20)print "#e67700"; else print "#2f9e44"}')
+        local bar_w col
+        bar_w=$(awk -v p="$pct" 'BEGIN{v=int(p*2); if(v>100)v=100; print v}')
+        col=$(awk -v p="$pct" 'BEGIN{if(p+0>=50)print "#c92a2a"; else if(p+0>=20)print "#e67700"; else print "#2f9e44"}')
         cpu_rows+="<tr><td class='mono'>$(html_e "$proc")</td><td><div class='bar-cell'><div class='bar-track'><div class='bar-fill' style='width:${bar_w}%;background:${col}'></div></div><span class='bar-val' style='color:${col}'>${pct}%</span></div></td></tr>"
     done < <(ps -eo comm,%cpu --sort=-%cpu 2>/dev/null | awk 'NR>1&&NR<=8{print $1,$2}')
 
-    # Memory
+    # Memory rows
     local mem_rows=""
     while read -r proc pct; do
-        local bar_w=$(echo "$pct" | awk '{v=int($1*5); if(v>100)v=100; print v}')
-        local col; col=$(awk -v p="$pct" 'BEGIN{if(p+0>=20)print "#c92a2a"; else if(p+0>=10)print "#e67700"; else print "#1c7ed6"}')
+        local bar_w col
+        bar_w=$(awk -v p="$pct" 'BEGIN{v=int(p*5); if(v>100)v=100; print v}')
+        col=$(awk -v p="$pct" 'BEGIN{if(p+0>=20)print "#c92a2a"; else if(p+0>=10)print "#e67700"; else print "#1c7ed6"}')
         mem_rows+="<tr><td class='mono'>$(html_e "$proc")</td><td><div class='bar-cell'><div class='bar-track'><div class='bar-fill' style='width:${bar_w}%;background:${col}'></div></div><span class='bar-val' style='color:${col}'>${pct}%</span></div></td></tr>"
     done < <(ps -eo comm,%mem --sort=-%mem 2>/dev/null | awk 'NR>1&&NR<=8{print $1,$2}')
 
-    # Top URLs all-time
-    local url_tmp=$(mktemp)
-    for logfile in $ACCESSLOG_PATH; do
-        [ -f "$logfile" ] || continue
-        domain=$(echo "$logfile" | awk -F'/' '{print $5}')
-        awk -v dom="$domain" '{print dom, $7}' "$logfile" 2>/dev/null
-    done | sort | uniq -c | sort -nr | head -10 > "$url_tmp"
+    # URL rows from cached data
     local url_rows=""
-    while read -r hits dom url; do
-        url_rows+="<tr><td class='count'>$(html_e "$hits")</td><td class='dim'>$(html_e "$dom")</td><td class='url-cell'>$(html_e "$url")</td></tr>"
-    done < "$url_tmp"
-    rm -f "$url_tmp"
-
-    # Top IPs all-time
-    local ip_tmp=$(mktemp)
-    for log in $ACCESSLOG_PATH; do
-        [ -f "$log" ] && awk '{print $1}' "$log"
-    done 2>/dev/null | sort | uniq -c | sort -nr | head -10 > "$ip_tmp"
-
-    local max_ip_hits=1
-    max_ip_hits=$(head -1 "$ip_tmp" | awk '{print $1+0}'); [ "${max_ip_hits:-0}" -eq 0 ] && max_ip_hits=1
-    local ip_rows=""
-    while read -r hits ip; do
-        local bw=$(awk -v h="$hits" -v m="$max_ip_hits" 'BEGIN{printf "%d", h/m*100}')
-        ip_rows+="<tr><td class='count'>$(html_e "$hits")</td><td class='ip-cell'>$(html_e "$ip")</td><td><div class='bar-track'><div class='bar-fill' style='width:${bw}%;background:#1c7ed6'></div></div></td></tr>"
-    done < "$ip_tmp"
-    rm -f "$ip_tmp"
-
-    # Live URLs
-    local live_tmp=$(mktemp)
-    for log in $ACCESSLOG_PATH; do
-        [ -f "$log" ] || continue
-        dom=$(echo "$log" | awk -F'/' '{print $5}')
-        tail -n 500 "$log" | grep "$CUR_MIN" | \
-            awk -v d="$dom" '{print d, $1, $7}' >> "$live_tmp"
-    done
-    local live_url_rows=""
-    if [ -s "$live_tmp" ]; then
-        while read -r hits dom ip url; do
-            live_url_rows+="<tr><td class='count'>$(html_e "$hits")</td><td class='dim'>$(html_e "$dom")</td><td class='ip-cell'>$(html_e "$ip")</td><td class='url-cell'>$(html_e "$url")</td></tr>"
-        done < <(sort "$live_tmp" | uniq -c | sort -nr | head -10)
-    else
-        live_url_rows="<tr><td colspan='4' class='empty'>No traffic in current minute window</td></tr>"
+    if [ -f /tmp/mon_top_urls.dat ]; then
+        while read -r hits dom url; do
+            url_rows+="<tr><td class='count'>$(html_e "$hits")</td><td class='dim'>$(html_e "$dom")</td><td class='url-cell'>$(html_e "$url")</td></tr>"
+        done < <(head -10 /tmp/mon_top_urls.dat)
     fi
 
-    # Live top 3 IPs
-    local live_ip_rows=""
-    if [ -s "$live_tmp" ]; then
-        local max_live=1
-        max_live=$(awk '{print $2}' "$live_tmp" | sort | uniq -c | sort -nr | head -1 | awk '{print $1+0}')
-        [ "${max_live:-0}" -eq 0 ] && max_live=1
-        while read -r hits dom ip; do
-            hits=$(( ${hits:-0} + 0 ))
-            local bw=$(awk -v h="$hits" -v m="$max_live" 'BEGIN{printf "%d", h/m*100}')
-            live_ip_rows+="<tr><td class='count'>$(html_e "$hits")</td><td class='dim'>$(html_e "$dom")</td><td class='ip-cell'>$(html_e "$ip")</td><td><div class='bar-track'><div class='bar-fill' style='width:${bw}%;background:#1c7ed6'></div></div></td></tr>"
-        done < <(awk '{print $1, $2}' "$live_tmp" | sort | uniq -c | sort -nr | head -3)
-    else
-        live_ip_rows="<tr><td colspan='4' class='empty'>No traffic in current minute window</td></tr>"
+    # IP rows from cached data
+    local ip_rows="" max_ip_hits=1
+    if [ -f /tmp/mon_top_ips.dat ]; then
+        max_ip_hits=$(head -1 /tmp/mon_top_ips.dat | awk '{print $1+0}')
+        [ "${max_ip_hits:-0}" -eq 0 ] && max_ip_hits=1
+        while read -r hits ip; do
+            local bw
+            bw=$(awk -v h="$hits" -v m="$max_ip_hits" 'BEGIN{printf "%d", h/m*100}')
+            ip_rows+="<tr><td class='count'>$(html_e "$hits")</td><td class='ip-cell'>$(html_e "$ip")</td><td><div class='bar-track'><div class='bar-fill' style='width:${bw}%;background:#1c7ed6'></div></div></td></tr>"
+        done < <(head -10 /tmp/mon_top_ips.dat)
     fi
-    rm -f "$live_tmp"
 
-    # WP Login
+    # WP-Login
     local wl_total=0
-    for log in $ACCESSLOG_PATH; do
-        [ -f "$log" ] || continue
-        local _wc
-        _wc=$(grep -c "wp-login.php" "$log" 2>/dev/null | tr -d '[:space:]')
-        wl_total=$(( wl_total + ${_wc:-0} ))
-    done
+    [ -f /tmp/mon_wplogin.dat ] && wl_total=$(wc -l < /tmp/mon_wplogin.dat | tr -d '[:space:]')
+    wl_total=$(to_int "$wl_total")
     local wl_status_class="ok" wl_status_text="No wp-login.php hits detected" wl_dot_class="ok"
     [ "$wl_total" -gt 0 ] && { wl_status_class="alert"; wl_dot_class="alert"; wl_status_text="Login page hits detected"; }
     local wl_ip_rows=""
-    if [ "$wl_total" -gt 0 ]; then
+    if [ "$wl_total" -gt 0 ] && [ -f /tmp/mon_wplogin.dat ]; then
         while read -r hits ip; do
             wl_ip_rows+="<tr><td class='count count-hi'>$(html_e "$hits")</td><td class='ip-cell'>$(html_e "$ip")</td></tr>"
-        done < <(for log in $ACCESSLOG_PATH; do [ -f "$log" ] && grep "wp-login.php" "$log"; done 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -nr | head -5)
-    fi
-
-    # PHP Slowlog
-    local sl_plugin="" sl_domain="" sl_count="0" sl_frame_rows=""
-    if [ -f "$SLOWLOG" ]; then
-        sl_plugin=$(grep "wp-content/plugins/" "$SLOWLOG" | \
-            sed -rn 's/.*\/plugins\/([^/ ]+).*/\1/p' | \
-            sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
-        if [ -n "$sl_plugin" ]; then
-            sl_count=$(grep -c "$sl_plugin" "$SLOWLOG" 2>/dev/null | tr -d '[:space:]')
-            sl_count=$(( ${sl_count:-0} + 0 ))
-            sl_domain=$(grep "wp-content/plugins/$sl_plugin" "$SLOWLOG" | \
-                sed -rn 's/.*\/domains\/([^/]+)\/.*/\1/p' | \
-                sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
-
-            local max_frame=1
-            local frames_tmp=$(mktemp)
-            awk -v plugin="$sl_plugin" '
-            BEGIN { has_plugin = 0; nframes = 0 }
-            /^# Time:/ {
-                if (has_plugin) for (i=0;i<nframes;i++) print frames[i]
-                has_plugin=0; nframes=0; next
-            }
-            /^\[0x/ {
-                line=$0
-                sub(/^\[0x[0-9a-fA-F]+\] /,"",line)
-                sub(/\/home\/nginx\/domains\/[^\/]*\/public\//,"",line)
-                gsub(/"/,"\\\"",line)
-                frames[nframes++]=line
-                if(line~plugin) has_plugin=1
-                next
-            }
-            END { if(has_plugin) for(i=0;i<nframes;i++) print frames[i] }
-            ' "$SLOWLOG" | sort | uniq -c | sort -rn | head -20 > "$frames_tmp"
-
-            max_frame=$(head -1 "$frames_tmp" | awk '{print $1+0}'); [ "${max_frame:-0}" -eq 0 ] && max_frame=1
-
-            while IFS= read -r ranked_line; do
-                local cnt=$(echo "$ranked_line" | awk '{print $1}')
-                local frame=$(echo "$ranked_line" | cut -d' ' -f2-)
-                cnt=$(( ${cnt:-0} + 0 ))
-                local bw=$(awk -v c="$cnt" -v m="$max_frame" 'BEGIN{printf "%d", c/m*100}')
-                local fn_part path_part line_part
-                fn_part=$(echo "$frame"  | grep -oP '^[^\s]+\(\)')
-                path_part=$(echo "$frame" | grep -oP '(?<=\(\) ).+(?=:\d+$)')
-                line_part=$(echo "$frame" | grep -oP ':\d+$' | tr -d ':')
-                if [ -n "$fn_part" ]; then
-                    sl_frame_rows+="<div class='frame-row'>"
-                    sl_frame_rows+="<div class='frame-cnt'>${cnt}×</div>"
-                    sl_frame_rows+="<div class='frame-bar'><div class='frame-bar-fill' style='width:${bw}%'></div></div>"
-                    sl_frame_rows+="<div class='frame-text'><span class='fn'>$(html_e "$fn_part")</span> <span class='fpath'>$(html_e "$path_part")</span><span class='fline'>:${line_part}</span></div>"
-                    sl_frame_rows+="</div>"
-                else
-                    sl_frame_rows+="<div class='frame-row'><div class='frame-cnt'>${cnt}×</div><div class='frame-bar'><div class='frame-bar-fill' style='width:${bw}%'></div></div><div class='frame-text'>$(html_e "$frame")</div></div>"
-                fi
-            done < "$frames_tmp"
-            rm -f "$frames_tmp"
-        fi
+        done < <(awk '{print $2}' /tmp/mon_wplogin.dat | sort | uniq -c | sort -nr | head -5)
     fi
 
     # MySQL top queries
-    local mysql_query_rows=""
-    local mysql_avail=0
-
+    local mysql_query_rows="" mysql_avail=0
     local mysql_raw
     mysql_raw=$(mysql --batch --silent -e "
         SELECT
@@ -603,66 +559,16 @@ generate_html_report() {
 
     if [ -n "$mysql_raw" ]; then
         mysql_avail=1
-        local max_total_sec=1
-        local _mts
-        _mts=$(echo "$mysql_raw" | awk -F'\t' 'NR==1{v=$4+0; print (v>0)?v:1}')
-        [[ "$_mts" =~ ^[0-9]+(\.[0-9]+)?$ ]] && max_total_sec="$_mts"
-
         while IFS=$'\t' read -r db digest count total_sec avg_sec max_sec rows_exam rows_sent last_seen; do
             [ -z "$digest" ] && continue
-
-
-            local tbl
-            tbl=$(echo "$digest" | awk '{
-                txt = toupper($0)
-                n = split("FROM UPDATE INTO JOIN", keys, " ")
-                for (kw_i = 1; kw_i <= n; kw_i++) {
-                    kw = keys[kw_i]
-                    pos = index(txt, " " kw " ")
-                    if (pos > 0) {
-                        rest = substr($0, pos + length(kw) + 2)
-                        n2 = split(rest, parts, " ")
-                        t = parts[1]
-                        gsub(/[`()\[\]]/, "", t)
-                        gsub(/,.*/, "", t)
-                        if (t != "(" && t != "SELECT" && length(t) > 0) {
-                            print t; exit
-                        }
-                    }
-                }
-                print "—"
-            }')
-
-            if [ -z "$tbl" ] || [ "$tbl" = "—" ]; then
-                tbl=$(echo "$digest" | grep -ioP '(?<=\bFROM\b\s)\`?[a-zA-Z0-9_]+\`?' | head -1 | tr -d '`')
-                [ -z "$tbl" ] && tbl=$(echo "$digest" | grep -ioP '(?<=\bUPDATE\b\s)\`?[a-zA-Z0-9_]+\`?' | head -1 | tr -d '`')
-                [ -z "$tbl" ] && tbl=$(echo "$digest" | grep -ioP '(?<=\bINTO\b\s)\`?[a-zA-Z0-9_]+\`?' | head -1 | tr -d '`')
-                [ -z "$tbl" ] && tbl="—"
-            fi
-
             local short_digest="$digest"
             [ "${#digest}" -gt 110 ] && short_digest="${digest:0:107}..."
-
-            local avg_col
-            avg_col=$(awk -v a="$avg_sec" 'BEGIN{
-                if(a+0>=1)         print "#c92a2a"
-                else if(a+0>=0.1)  print "#e67700"
-                else if(a+0>=0.01) print "#495057"
-                else               print "#2f9e44"
-            }')
-
-            local max_col
-            max_col=$(awk -v m="$max_sec" 'BEGIN{
-                if(m+0>=5)        print "#c92a2a"
-                else if(m+0>=1)   print "#e67700"
-                else              print "#2f9e44"
-            }')
+            local avg_col max_col
+            avg_col=$(awk -v a="$avg_sec" 'BEGIN{if(a+0>=1)print "#c92a2a"; else if(a+0>=0.1)print "#e67700"; else if(a+0>=0.01)print "#495057"; else print "#2f9e44"}')
+            max_col=$(awk -v m="$max_sec" 'BEGIN{if(m+0>=5)print "#c92a2a"; else if(m+0>=1)print "#e67700"; else print "#2f9e44"}')
 
             mysql_query_rows+="<tr>"
-            mysql_query_rows+="<td class='db-stack'>"
-            mysql_query_rows+="<div class='db-name'>$(html_e "$db")</div>"
-            mysql_query_rows+="<div class='db-table'>$(html_e "$tbl")</div>"
-            mysql_query_rows+="</td>"
+            mysql_query_rows+="<td class='db-stack'><div class='db-name'>$(html_e "$db")</div></td>"
             mysql_query_rows+="<td class='query-cell'>$(html_e "$short_digest")</td>"
             mysql_query_rows+="<td class='t-right t-num'>${count}</td>"
             mysql_query_rows+="<td class='t-right t-num'>${total_sec}s</td>"
@@ -675,284 +581,79 @@ generate_html_report() {
         done <<< "$mysql_raw"
     fi
 
-    cat > "$HTML_FILE" << HTMLEOF
+    # ── Write HTML ──
+    cat > "$HTML_FILE" << 'HTMLEOF_HEADER'
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+HTMLEOF_HEADER
+
+    cat >> "$HTML_FILE" << HTMLEOF_TITLE
 <title>Server Report — ${HOST_FULL}</title>
+HTMLEOF_TITLE
+
+    cat >> "$HTML_FILE" << 'HTMLEOF_STYLE'
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-:root {
-  --bg:      #f8f9fa;
-  --surface: #ffffff;
-  --border:  #e2e6ea;
-  --border2: #ced4da;
-  --txt:     #212529;
-  --txt2:    #495057;
-  --muted:   #6c757d;
-  --light:   #f1f3f5;
-  --accent:  #1c7ed6;
-  --green:   #2f9e44;
-  --red:     #c92a2a;
-  --orange:  #e67700;
-  --mono:    'JetBrains Mono', 'Courier New', monospace;
-  --sans:    'Inter', system-ui, sans-serif;
-  --radius:  6px;
-  --shadow:  0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.06);
-}
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  background: var(--bg);
-  color: var(--txt);
-  font-family: var(--sans);
-  font-size: 13.5px;
-  line-height: 1.55;
-  -webkit-font-smoothing: antialiased;
-}
-a { color: var(--accent); text-decoration: none; }
-a:hover { text-decoration: underline; }
-code {
-  font-family: var(--mono);
-  font-size: 12px;
-  background: var(--light);
-  padding: 1px 5px;
-  border-radius: 3px;
-  border: 1px solid var(--border);
-  color: var(--txt2);
-}
-
-/* ── Layout ─────────────────────────────────── */
-.wrap { max-width: 1280px; margin: 0 auto; padding: 32px 24px 64px; }
-.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
-.grid1 { display: grid; grid-template-columns: 1fr; gap: 16px; margin-bottom: 16px; }
-@media (max-width: 800px) { .grid2 { grid-template-columns: 1fr; } }
-
-/* ── Report header ───────────────────────────── */
-.report-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 24px;
-  flex-wrap: wrap;
-  padding-bottom: 24px;
-  margin-bottom: 28px;
-  border-bottom: 2px solid var(--border);
-}
-.rh-left .report-label {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: .08em;
-  text-transform: uppercase;
-  color: var(--muted);
-  margin-bottom: 4px;
-}
-.rh-left .report-host {
-  font-size: 26px;
-  font-weight: 600;
-  color: var(--txt);
-  line-height: 1.2;
-}
-.rh-right {
-  text-align: right;
-  font-size: 12.5px;
-  color: var(--txt2);
-  line-height: 1.7;
-}
-.rh-right strong { color: var(--txt); font-weight: 500; }
-
-/* ── Breadcrumb / nav ────────────────────────── */
-.nav-bar {
-  font-size: 12px;
-  color: var(--muted);
-  margin-bottom: 24px;
-  padding: 8px 12px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-}
-.nav-bar a { color: var(--accent); }
-
-/* ── Panels ──────────────────────────────────── */
-.panel {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow);
-  overflow: hidden;
-}
-.panel-header {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 11px 16px;
-  border-bottom: 1px solid var(--border);
-  background: var(--light);
-}
-.panel-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--txt);
-  letter-spacing: .01em;
-  flex: 1;
-}
-
-/* ── Status badges ───────────────────────────── */
-.badge {
-  display: inline-block;
-  font-size: 11px;
-  font-weight: 500;
-  padding: 2px 8px;
-  border-radius: 4px;
-  border: 1px solid transparent;
-}
-.badge-ok     { background: #ebfbee; color: #2f9e44; border-color: #b2f2bb; }
-.badge-warn   { background: #fff9db; color: #e67700; border-color: #ffec99; }
-.badge-alert  { background: #fff5f5; color: #c92a2a; border-color: #ffc9c9; }
-.badge-info   { background: #e7f5ff; color: #1971c2; border-color: #a5d8ff; }
-
-/* ── Tables ──────────────────────────────────── */
-table { width: 100%; border-collapse: collapse; }
-thead tr { border-bottom: 1px solid var(--border); }
-th {
-  padding: 8px 14px;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--muted);
-  text-align: left;
-  text-transform: uppercase;
-  letter-spacing: .06em;
-  background: var(--light);
-}
-td {
-  padding: 9px 14px;
-  font-size: 13px;
-  color: var(--txt2);
-  border-bottom: 1px solid var(--border);
-  vertical-align: middle;
-}
-tr:last-child td { border-bottom: none; }
-tbody tr:hover td { background: #f8f9fa; }
-
-/* ── Count pill ──────────────────────────────── */
-.count {
-  display: inline-block;
-  font-family: var(--mono);
-  font-size: 11.5px;
-  font-weight: 500;
-  min-width: 42px;
-  text-align: right;
-  color: var(--txt);
-}
-.count-hi  { color: var(--red); }
-.count-med { color: var(--orange); }
-
-/* ── Bar chart ───────────────────────────────── */
-.bar-cell { display: flex; align-items: center; gap: 10px; }
-.bar-track { flex: 1; height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; min-width: 60px; }
-.bar-fill  { height: 100%; border-radius: 3px; }
-.bar-val   { font-size: 12px; font-family: var(--mono); min-width: 40px; text-align: right; color: var(--txt2); }
-
-/* ── Monospace cells ─────────────────────────── */
-.mono     { font-family: var(--mono); font-size: 12px; color: var(--txt); }
-.url-cell { font-family: var(--mono); font-size: 11.5px; color: var(--accent); word-break: break-all; max-width: 320px; }
-.ip-cell  { font-family: var(--mono); font-size: 12px; color: var(--txt); }
-.dim      { color: var(--muted); font-size: 12px; }
-
-/* ── Status indicator ────────────────────────── */
-.status-row { display: flex; align-items: center; gap: 12px; padding: 14px 16px; }
-.status-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
-.status-dot.ok    { background: var(--green); }
-.status-dot.alert { background: var(--red); }
-.status-label { font-size: 13.5px; font-weight: 500; color: var(--txt); }
-.status-count { margin-left: auto; font-size: 22px; font-weight: 600; font-family: var(--mono); color: var(--red); }
-
-/* ── Key–value meta table ────────────────────── */
-.kv-table { padding: 12px 16px 4px; }
-.kv-table table { border: none; }
-.kv-table td { border: none; padding: 4px 16px 4px 0; font-size: 12.5px; color: var(--txt2); }
-.kv-table td:first-child { color: var(--muted); width: 120px; font-size: 12px; }
-.kv-table td strong { color: var(--txt); font-weight: 500; }
-
-/* ── Section label ───────────────────────────── */
-.section-label {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: .07em;
-  text-transform: uppercase;
-  color: var(--muted);
-  padding: 14px 16px 6px;
-}
-
-/* ── Call stack frames ───────────────────────── */
-.frame-list { padding: 4px 0 8px; }
-.frame-row {
-  display: flex;
-  align-items: center;
-  gap: 0;
-  padding: 5px 16px;
-  border-bottom: 1px solid var(--border);
-}
-.frame-row:last-child { border-bottom: none; }
-.frame-row:hover { background: var(--light); }
-.frame-cnt  { flex-shrink: 0; width: 40px; font-size: 11.5px; font-family: var(--mono); font-weight: 500; color: var(--muted); text-align: right; margin-right: 12px; }
-.frame-bar  { flex-shrink: 0; width: 64px; height: 3px; background: var(--border); border-radius: 2px; margin-right: 14px; overflow: hidden; }
-.frame-bar-fill { height: 100%; background: var(--orange); border-radius: 2px; }
-.frame-text { flex: 1; font-family: var(--mono); font-size: 11.5px; color: var(--txt2); word-break: break-all; }
-.fn    { color: var(--accent); font-weight: 500; }
-.fpath { color: var(--muted); }
-.fline { color: var(--orange); }
-
-/* ── Empty state ─────────────────────────────── */
-.empty { padding: 20px 16px; font-size: 12.5px; color: var(--muted); text-align: center; }
-
-/* ── MySQL query table ───────────────────────── */
-.query-cell {
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--txt2);
-  word-break: break-all;
-  max-width: 480px;
-  line-height: 1.5;
-}
-.db-stack { white-space: nowrap; vertical-align: top; }
-.db-name  { font-size: 12px; font-weight: 500; color: var(--accent); }
-.db-table { font-size: 11px; color: var(--muted); margin-top: 2px; font-family: var(--mono); }
-.mysql-note {
-  padding: 10px 16px;
-  font-size: 12px;
-  color: var(--muted);
-  border-bottom: 1px solid var(--border);
-  background: var(--light);
-}
-.t-right { text-align: right; }
-.t-num   { font-family: var(--mono); font-size: 12px; }
-
-/* ── Footer ──────────────────────────────────── */
-.report-footer {
-  margin-top: 48px;
-  padding-top: 16px;
-  border-top: 1px solid var(--border);
-  display: flex;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--muted);
-}
+:root{--bg:#f8f9fa;--surface:#fff;--border:#e2e6ea;--txt:#212529;--txt2:#495057;--muted:#6c757d;--light:#f1f3f5;--accent:#1c7ed6;--green:#2f9e44;--red:#c92a2a;--orange:#e67700;--mono:'JetBrains Mono','Courier New',monospace;--sans:'Inter',system-ui,sans-serif;--radius:6px;--shadow:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.06)}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font-family:var(--sans);font-size:13.5px;line-height:1.55;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+code{font-family:var(--mono);font-size:12px;background:var(--light);padding:1px 5px;border-radius:3px;border:1px solid var(--border);color:var(--txt2)}
+.wrap{max-width:1280px;margin:0 auto;padding:32px 24px 64px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+.grid1{display:grid;grid-template-columns:1fr;gap:16px;margin-bottom:16px}
+@media(max-width:800px){.grid2{grid-template-columns:1fr}}
+.report-header{display:flex;justify-content:space-between;align-items:flex-start;gap:24px;flex-wrap:wrap;padding-bottom:24px;margin-bottom:28px;border-bottom:2px solid var(--border)}
+.rh-left .report-label{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
+.rh-left .report-host{font-size:26px;font-weight:600;color:var(--txt);line-height:1.2}
+.rh-right{text-align:right;font-size:12.5px;color:var(--txt2);line-height:1.7}
+.rh-right strong{color:var(--txt);font-weight:500}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+.panel-header{display:flex;align-items:center;gap:10px;padding:11px 16px;border-bottom:1px solid var(--border);background:var(--light)}
+.panel-title{font-size:12px;font-weight:600;color:var(--txt);letter-spacing:.01em;flex:1}
+.badge{display:inline-block;font-size:11px;font-weight:500;padding:2px 8px;border-radius:4px;border:1px solid transparent}
+.badge-ok{background:#ebfbee;color:#2f9e44;border-color:#b2f2bb}
+.badge-warn{background:#fff9db;color:#e67700;border-color:#ffec99}
+.badge-alert{background:#fff5f5;color:#c92a2a;border-color:#ffc9c9}
+.badge-info{background:#e7f5ff;color:#1971c2;border-color:#a5d8ff}
+table{width:100%;border-collapse:collapse}
+thead tr{border-bottom:1px solid var(--border)}
+th{padding:8px 14px;font-size:11px;font-weight:600;color:var(--muted);text-align:left;text-transform:uppercase;letter-spacing:.06em;background:var(--light)}
+td{padding:9px 14px;font-size:13px;color:var(--txt2);border-bottom:1px solid var(--border);vertical-align:middle}
+tr:last-child td{border-bottom:none}tbody tr:hover td{background:#f8f9fa}
+.count{display:inline-block;font-family:var(--mono);font-size:11.5px;font-weight:500;min-width:42px;text-align:right;color:var(--txt)}
+.count-hi{color:var(--red)}.count-med{color:var(--orange)}
+.bar-cell{display:flex;align-items:center;gap:10px}
+.bar-track{flex:1;height:5px;background:var(--border);border-radius:3px;overflow:hidden;min-width:60px}
+.bar-fill{height:100%;border-radius:3px}
+.bar-val{font-size:12px;font-family:var(--mono);min-width:40px;text-align:right;color:var(--txt2)}
+.mono{font-family:var(--mono);font-size:12px;color:var(--txt)}
+.url-cell{font-family:var(--mono);font-size:11.5px;color:var(--accent);word-break:break-all;max-width:320px}
+.ip-cell{font-family:var(--mono);font-size:12px;color:var(--txt)}
+.dim{color:var(--muted);font-size:12px}
+.status-row{display:flex;align-items:center;gap:12px;padding:14px 16px}
+.status-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.status-dot.ok{background:var(--green)}.status-dot.alert{background:var(--red)}
+.status-label{font-size:13.5px;font-weight:500;color:var(--txt)}
+.status-count{margin-left:auto;font-size:22px;font-weight:600;font-family:var(--mono);color:var(--red)}
+.kv-table{padding:12px 16px 4px}.kv-table table{border:none}.kv-table td{border:none;padding:4px 16px 4px 0;font-size:12.5px;color:var(--txt2)}.kv-table td:first-child{color:var(--muted);width:120px;font-size:12px}.kv-table td strong{color:var(--txt);font-weight:500}
+.empty{padding:20px 16px;font-size:12.5px;color:var(--muted);text-align:center}
+.query-cell{font-family:var(--mono);font-size:11.5px;color:var(--txt2);word-break:break-all;max-width:480px;line-height:1.5}
+.db-stack{white-space:nowrap;vertical-align:top}.db-name{font-size:12px;font-weight:500;color:var(--accent)}
+.mysql-note{padding:10px 16px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border);background:var(--light)}
+.t-right{text-align:right}.t-num{font-family:var(--mono);font-size:12px}
+.report-footer{margin-top:48px;padding-top:16px;border-top:1px solid var(--border);display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;font-size:12px;color:var(--muted)}
 </style>
 </head>
 <body>
 <div class="wrap">
+HTMLEOF_STYLE
 
-<div class="nav-bar">
-  <a href="./">All reports</a> &rsaquo; ${NOW_SLUG}.html
-  &nbsp;&nbsp;&middot;&nbsp;&nbsp;
-  <a href="../report.html">Latest report</a>
-</div>
-
+    cat >> "$HTML_FILE" << HTMLEOF_BODY
 <div class="report-header">
   <div class="rh-left">
     <div class="report-label">Server Performance Report</div>
@@ -968,63 +669,22 @@ tbody tr:hover td { background: #f8f9fa; }
 <div class="grid2">
   <div class="panel">
     <div class="panel-header"><span class="panel-title">CPU Usage — Top Processes</span></div>
-    <table>
-      <thead><tr><th>Process</th><th>CPU %</th></tr></thead>
-      <tbody>${cpu_rows}</tbody>
-    </table>
+    <table><thead><tr><th>Process</th><th>CPU %</th></tr></thead><tbody>${cpu_rows}</tbody></table>
   </div>
   <div class="panel">
     <div class="panel-header"><span class="panel-title">Memory Usage — Top Processes</span></div>
-    <table>
-      <thead><tr><th>Process</th><th>Memory %</th></tr></thead>
-      <tbody>${mem_rows}</tbody>
-    </table>
+    <table><thead><tr><th>Process</th><th>Memory %</th></tr></thead><tbody>${mem_rows}</tbody></table>
   </div>
 </div>
 
 <div class="grid2">
   <div class="panel">
-    <div class="panel-header">
-      <span class="panel-title">Top URLs by Hit Count</span>
-      <span class="badge badge-info">All-time</span>
-    </div>
-    <table>
-      <thead><tr><th>Hits</th><th>Domain</th><th>URL</th></tr></thead>
-      <tbody>${url_rows}</tbody>
-    </table>
+    <div class="panel-header"><span class="panel-title">Top URLs by Hit Count</span><span class="badge badge-info">Window</span></div>
+    <table><thead><tr><th>Hits</th><th>Domain</th><th>URL</th></tr></thead><tbody>${url_rows}</tbody></table>
   </div>
   <div class="panel">
-    <div class="panel-header">
-      <span class="panel-title">Top IP Addresses by Hit Count</span>
-      <span class="badge badge-info">All-time</span>
-    </div>
-    <table>
-      <thead><tr><th>Hits</th><th>IP Address</th><th>Share</th></tr></thead>
-      <tbody>${ip_rows}</tbody>
-    </table>
-  </div>
-</div>
-
-<div class="grid2">
-  <div class="panel">
-    <div class="panel-header">
-      <span class="panel-title">Top URLs — Current Minute</span>
-      <span class="badge badge-ok">Live</span>
-    </div>
-    <table>
-      <thead><tr><th>Hits</th><th>Domain</th><th>IP</th><th>URL</th></tr></thead>
-      <tbody>${live_url_rows}</tbody>
-    </table>
-  </div>
-  <div class="panel">
-    <div class="panel-header">
-      <span class="panel-title">Top IP Addresses — Current Minute</span>
-      <span class="badge badge-ok">Live</span>
-    </div>
-    <table>
-      <thead><tr><th>Hits</th><th>Domain</th><th>IP</th><th>Share</th></tr></thead>
-      <tbody>${live_ip_rows}</tbody>
-    </table>
+    <div class="panel-header"><span class="panel-title">Top IP Addresses</span><span class="badge badge-info">Window</span></div>
+    <table><thead><tr><th>Hits</th><th>IP Address</th><th>Share</th></tr></thead><tbody>${ip_rows}</tbody></table>
   </div>
 </div>
 
@@ -1032,39 +692,14 @@ tbody tr:hover td { background: #f8f9fa; }
   <div class="panel">
     <div class="panel-header">
       <span class="panel-title">WP-Login.php Activity</span>
-      $([ "$wl_total" -gt 0 ] && echo "<span class='badge badge-alert'>${wl_total} hits detected</span>" || echo "<span class='badge badge-ok'>No activity</span>")
+      $([ "$wl_total" -gt 0 ] && echo "<span class='badge badge-alert'>${wl_total} hits</span>" || echo "<span class='badge badge-ok'>Clear</span>")
     </div>
     <div class="status-row">
       <div class="status-dot ${wl_dot_class}"></div>
-      <div>
-        <div class="status-label">${wl_status_text}</div>
-        $([ "$wl_total" -gt 0 ] && echo "<div class='dim' style='margin-top:2px'>Total hits recorded in access logs</div>")
-      </div>
+      <div><div class="status-label">${wl_status_text}</div></div>
       $([ "$wl_total" -gt 0 ] && echo "<div class='status-count'>${wl_total}</div>")
     </div>
-    $([ -n "$wl_ip_rows" ] && echo "<div class='section-label'>Top offending IP addresses</div><table><thead><tr><th>Hits</th><th>IP Address</th></tr></thead><tbody>${wl_ip_rows}</tbody></table>")
-  </div>
-</div>
-
-<div class="grid1">
-  <div class="panel">
-    <div class="panel-header">
-      <span class="panel-title">PHP Slow Log — Top Offending Plugin</span>
-      $([ -n "$sl_plugin" ] && echo "<span class='badge badge-warn'>${sl_count} slow entries</span>")
-    </div>
-    $(if [ -n "$sl_plugin" ]; then
-        echo "<div class='kv-table'><table><tbody>"
-        echo "<tr><td>Plugin</td><td><strong>$(html_e "$sl_plugin")</strong></td></tr>"
-        echo "<tr><td>Domain</td><td>$(html_e "$sl_domain")</td></tr>"
-        echo "<tr><td>Slow entries</td><td><strong>${sl_count}</strong></td></tr>"
-        echo "</tbody></table></div>"
-        if [ -n "$sl_frame_rows" ]; then
-            echo "<div class='section-label'>Most frequent call stack frames</div>"
-            echo "<div class='frame-list'>${sl_frame_rows}</div>"
-        fi
-    else
-        echo "<div class='empty'>No slow log data — slow log not configured or no entries recorded.</div>"
-    fi)
+    $([ -n "$wl_ip_rows" ] && echo "<table><thead><tr><th>Hits</th><th>IP Address</th></tr></thead><tbody>${wl_ip_rows}</tbody></table>")
   </div>
 </div>
 
@@ -1075,24 +710,12 @@ tbody tr:hover td { background: #f8f9fa; }
       $([ "$mysql_avail" -eq 1 ] && echo "<span class='badge badge-info'>performance_schema</span>" || echo "<span class='badge badge-alert'>Unavailable</span>")
     </div>
     $(if [ "$mysql_avail" -eq 1 ] && [ -n "$mysql_query_rows" ]; then
-        echo "<div class='mysql-note'>Aggregated since last server restart or <code>TRUNCATE performance_schema.events_statements_summary_by_digest</code>. Sorted by total cumulative execution time.</div>"
-        echo "<div style='overflow-x:auto'>"
-        echo "<table>"
-        echo "<thead><tr>"
-        echo "<th>Database / Table</th>"
-        echo "<th>Query Digest</th>"
-        echo "<th class='t-right'>Calls</th>"
-        echo "<th class='t-right'>Total time</th>"
-        echo "<th class='t-right'>Avg time</th>"
-        echo "<th class='t-right'>Max time</th>"
-        echo "<th class='t-right'>Rows examined</th>"
-        echo "<th class='t-right'>Rows sent</th>"
-        echo "<th>Last seen</th>"
-        echo "</tr></thead>"
-        echo "<tbody>${mysql_query_rows}</tbody>"
-        echo "</table></div>"
+        echo "<div class='mysql-note'>Aggregated since last server restart. Sorted by total cumulative execution time.</div>"
+        echo "<div style='overflow-x:auto'><table>"
+        echo "<thead><tr><th>Database</th><th>Query Digest</th><th class='t-right'>Calls</th><th class='t-right'>Total</th><th class='t-right'>Avg</th><th class='t-right'>Max</th><th class='t-right'>Rows exam</th><th class='t-right'>Rows sent</th><th>Last seen</th></tr></thead>"
+        echo "<tbody>${mysql_query_rows}</tbody></table></div>"
     else
-        echo "<div class='empty'>$([ "$mysql_avail" -eq 0 ] && echo 'MySQL is not accessible or performance_schema is not enabled.' || echo 'No query data available.')</div>"
+        echo "<div class='empty'>MySQL is not accessible or no query data available.</div>"
     fi)
   </div>
 </div>
@@ -1101,305 +724,170 @@ tbody tr:hover td { background: #f8f9fa; }
   <span>Server Monitor Dashboard &middot; ${HOST_FULL}</span>
   <span>Generated ${NOW_FULL}</span>
 </div>
+</div></body></html>
+HTMLEOF_BODY
 
-</div>
-</body>
-</html>
-HTMLEOF
+    echo "  HTML report written: $HTML_FILE"
 
-    echo "  ✔  HTML report written: $HTML_FILE"
-    echo ""
-    echo "  ┌─────────────────────────────────────────────────────"
-    echo "  │  📄 This report  : ${REPORT_URL}"
-    echo "  │  🔗 Latest (always): ${LATEST_URL}"
-    echo "  │  📁 All reports  : ${INDEX_URL}"
-    echo "  └─────────────────────────────────────────────────────"
-    echo ""
+    # Redirect page
+    local REL_PATH="${REPORT_SUBDIR:+${REPORT_SUBDIR}/}${NOW_SLUG}.html"
+    cat > "${REPORT_WEBROOT}/report.html" 2>/dev/null << REOF
+<!DOCTYPE html><html><head><meta charset="UTF-8"><meta http-equiv="refresh" content="0;url=${REL_PATH}"></head>
+<body><p>Redirecting to <a href="${REL_PATH}">latest report</a>...</p></body></html>
+REOF
 
-    local REL_PATH
-    if [ -n "$REPORT_SUBDIR" ]; then
-        REL_PATH="${REPORT_SUBDIR}/${NOW_SLUG}.html"
-    else
-        REL_PATH="${NOW_SLUG}.html"
-    fi
-
-    cat > "${REPORT_WEBROOT}/report.html" << REDIREOF
-<!DOCTYPE html>
-<html><head>
-<meta charset="UTF-8">
-<meta http-equiv="refresh" content="0;url=${REL_PATH}">
-<title>Redirecting to latest report...</title>
-</head><body>
-<p>Redirecting to <a href="${REL_PATH}">latest report</a>...</p>
-</body></html>
-REDIREOF
-    echo "  ✔  Latest redirect  : ${LATEST_URL}"
-
-    {
-        echo '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
-        echo '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        echo "<title>Reports — ${HOST_FULL}</title>"
-        echo '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">'
-        echo '<style>body{background:#f8f9fa;color:#212529;font-family:Inter,system-ui,sans-serif;padding:40px 24px;max-width:860px;margin:0 auto;font-size:14px;-webkit-font-smoothing:antialiased}h1{font-size:22px;font-weight:600;color:#212529;margin-bottom:6px}p{color:#6c757d;font-size:13px;margin-bottom:28px}a{color:#1c7ed6;text-decoration:none}a:hover{text-decoration:underline}.report-list{list-style:none;border:1px solid #e2e6ea;border-radius:6px;overflow:hidden;background:#fff}.report-list li{border-bottom:1px solid #e2e6ea;padding:11px 16px;display:flex;align-items:center;gap:12px;font-size:13px}.report-list li:last-child{border-bottom:none}.report-list a{color:#1c7ed6}.ts{color:#adb5bd;font-size:12px;margin-left:auto;font-family:monospace}.latest{background:#e7f5ff;border-left:3px solid #1c7ed6}</style>'
-        echo '</head><body>'
-        echo "<h1>${HOST_FULL}</h1>"
-        echo "<p>Server performance reports &middot; <a href='../report.html'>Latest report</a></p>"
-        echo '<ul class="report-list">'
-        local first=1
-        for f in $(ls -t "$PUB_DIR"/*.html 2>/dev/null); do
-            local fname=$(basename "$f")
-            local fdate=$(echo "$fname" | sed 's/_/ /;s/-/:/g;s/\.html//')
-            if [ "$first" -eq 1 ]; then
-                echo "<li class='latest'><a href='${fname}'>${fname}</a><span class='ts'>Latest</span></li>"
-                first=0
-            else
-                echo "<li><a href='${fname}'>${fname}</a><span class='ts'>${fdate}</span></li>"
-            fi
-        done
-        echo '</ul></body></html>'
-    } > "${PUB_DIR}/index.html"
-    echo "  ✔  Report index     : ${INDEX_URL}"
-
+    # Prune old reports (keep 30)
     local old_reports
     old_reports=$(ls -t "$PUB_DIR"/*.html 2>/dev/null | grep -v "index.html" | tail -n +31)
-    if [ -n "$old_reports" ]; then
-        echo "$old_reports" | xargs rm -f
-        echo "  ✔  Pruned old reports (kept latest 30)"
-    fi
+    [ -n "$old_reports" ] && echo "$old_reports" | xargs rm -f
 
-    if [ -n "$REPORT_ENDPOINT" ]; then
-        local JSON_FILE="/tmp/monitor_report_${NOW_SLUG}.json"
-        cat > "$JSON_FILE" << JSONEOF
-{"meta":{"generated":"$(json_str "$NOW_FULL")","host":"$(json_str "$HOST_FULL")","uptime":"$(json_str "$UPTIME_S")","load":"$(json_str "$LOAD")"}}
-JSONEOF
-        echo "  Sending to $REPORT_ENDPOINT ..."
-        http_code=$(curl -s -o /tmp/report_resp.txt -w "%{http_code}" \
-            -X POST -H "Content-Type: application/json" \
-            -H "X-Report-Token: ${REPORT_TOKEN}" \
-            --data-binary "@${JSON_FILE}" "$REPORT_ENDPOINT" 2>/dev/null)
-        [ "$http_code" = "200" ] && echo "  ✔  Remote: $(cat /tmp/report_resp.txt)" || echo "  ✘  Remote send failed (HTTP $http_code)"
-        rm -f "$JSON_FILE" /tmp/report_resp.txt
-    fi
+    echo "  Report URL: ${REPORT_URL}"
 }
 
+# ── TRAP: exit report ────────────────────────────
 trap '
     echo ""
     echo "  Generating exit report..."
-    echo ""
     generate_report
     echo ""
-    echo "  Writing HTML report to web root..."
-    echo ""
+    echo "  Writing HTML report..."
     generate_html_report
-    rm -f "$FRAME"
-    rm -f "$ABUSEIPDB_CACHE"
+    rm -f "${FRAME:-}" /tmp/mon_top_ips.dat /tmp/mon_top_urls.dat /tmp/mon_live_traffic.dat /tmp/mon_wplogin.dat
     exit 0
 ' INT
 
 # ════════════════════════════════════════════════
-FRAME=$(mktemp)
-while true; do
+#  DETECT SERVER IPs (once at startup — doesn't change)
+# ════════════════════════════════════════════════
+SERVER_IPS=""
+# Primary: all non-loopback IPv4 addresses from interfaces
+if command -v ip &>/dev/null; then
+    SERVER_IPS=$(ip -4 addr show scope global 2>/dev/null | \
+        awk '/inet /{sub(/\/.*/, "", $2); printf "%s  ", $2}')
+fi
+# Fallback: hostname -I (space-separated, may include IPv6)
+if [ -z "$SERVER_IPS" ]; then
+    SERVER_IPS=$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) printf "%s  ", $i}')
+fi
+# Append public IP if available (may differ from interface IP behind NAT)
+SERVER_PUBLIC_IP=$(curl -sS --max-time 3 https://ifconfig.me 2>/dev/null || \
+                   curl -sS --max-time 3 https://api.ipify.org 2>/dev/null || echo "")
+if [ -n "$SERVER_PUBLIC_IP" ]; then
+    # Only append if it's not already in the list
+    case "$SERVER_IPS" in
+        *"$SERVER_PUBLIC_IP"*) ;;
+        *) SERVER_IPS="${SERVER_IPS}${SERVER_PUBLIC_IP} (public)" ;;
+    esac
+fi
+SERVER_IPS="${SERVER_IPS:-unknown}"
 
-    # ── All output goes into $FRAME first ────────
-    # clear + cat happen together at the end so the
-    # terminal never shows a partial/scrolling render
-    {
+# ════════════════════════════════════════════════
+#  MAIN LOOP
+# ════════════════════════════════════════════════
+FRAME=$(mktemp)
+
+render_frame() {
+    # ── Recalc layout on every frame (handles resize) ──
+    _recalc_layout
+
+    # ── Timing ────────────────────────────────────
+    LOOP_START=$(date +%s)
     NOW=$(date "+%A, %d %b %Y  %H:%M:%S")
     HOST=$(hostname -s 2>/dev/null || echo "server")
     UPTIME_STR=$(uptime -p 2>/dev/null | sed 's/up //' || uptime | awk '{print $3,$4}' | tr -d ',')
     LOAD_AVG=$(uptime | awk -F'load average:' '{print $2}' | xargs)
+    CUR_MIN=$(date "+%d/%b/%Y:%H:%M")
+
+    # ── SINGLE-PASS LOG EXTRACTION ────────────────
+    extract_logs "$CUR_MIN"
+
+    # ── Load IP cache into memory ─────────────────
+    _load_ip_cache
 
     # ── DISK WARNING ──────────────────────────────
     DISK_WARN=""
     while read -r pct mount; do
-        pct_num="${pct%%%}"   # strip the % sign
+        pct_num="${pct%%%}"
         if [ "${pct_num:-0}" -ge 98 ] 2>/dev/null; then
             DISK_WARN="${DISK_WARN}${mount} at ${pct}  "
         fi
     done < <(df -h --output=pcent,target 2>/dev/null | awk 'NR>1 && $1!="Use%"')
 
     # ── HEADER ────────────────────────────────────
-    hline '═' "$BLUE_D"
-    hdr_left="  🖥  SYSTEM MONITOR DASHBOARD"
+    hline '=' "$BLUE_D"
+    hdr_left="  SYSTEM MONITOR DASHBOARD"
     pad=$(( TW - ${#hdr_left} - ${#NOW} - 4 ))
     [ "$pad" -lt 1 ] && pad=1
     printf "${BG_HEADER}${CYAN}${BOLD}%s%*s${YELLOW}%s  ${R}\n" "$hdr_left" "$pad" "" "$NOW"
-    hline '═' "$BLUE_D"
+    hline '=' "$BLUE_D"
 
     if [ -n "$DISK_WARN" ]; then
-        hline '█' "$BG_ALERT"
-        warn_txt="  ⚠  CRITICAL DISK USAGE:  ${DISK_WARN}"
-        warn_pad=$(( (TW - ${#warn_txt}) / 2 ))
-        [ "$warn_pad" -lt 0 ] && warn_pad=0
-        printf "${BG_ALERT}${RED}${BOLD}${BLINK}%*s%s%*s${R}\n" \
-            "$warn_pad" "" "$warn_txt" "$warn_pad" ""
-        hline '█' "$BG_ALERT"
+        printf "${BG_ALERT}${RED}${BOLD}${BLINK}  CRITICAL DISK USAGE: %s${R}\n" "$DISK_WARN"
     fi
 
     printf "\n"
-    printf "  ${DGRAY}◆ HOST:${R}  ${WHITE}${BOLD}%-24s${R}  " "$HOST"
-    printf "${DGRAY}◆ UPTIME:${R} ${WHITE}${BOLD}%-26s${R}  " "$UPTIME_STR"
-    printf "${DGRAY}◆ LOAD AVG:${R} ${WHITE}${BOLD}%s${R}\n\n" "$LOAD_AVG"
+    printf "  ${DGRAY}HOST:${R} ${WHITE}${BOLD}%-24s${R}  " "$HOST"
+    printf "${DGRAY}UPTIME:${R} ${WHITE}${BOLD}%-26s${R}  " "$UPTIME_STR"
+    printf "${DGRAY}LOAD:${R} ${WHITE}${BOLD}%s${R}\n" "$LOAD_AVG"
+    printf "  ${DGRAY}SERVER IP:${R} ${CYAN}${BOLD}%s${R}\n\n" "$SERVER_IPS"
 
-    # ── SYSTEM PRESSURE BAR ───────────────────────
+    # ── SYSTEM PRESSURE ───────────────────────────
     {
-        read_cpu1=$(awk '/^cpu / {print $5, $6}' /proc/stat 2>/dev/null)
+        read_idle1=$(awk '/^cpu / {print $5}' /proc/stat 2>/dev/null)
+        read_iow1=$(awk '/^cpu / {print $6}' /proc/stat 2>/dev/null)
         read_total1=$(awk '/^cpu / {s=0; for(i=2;i<=NF;i++) s+=$i; print s}' /proc/stat 2>/dev/null)
         sleep 0.3
-        read_cpu2=$(awk '/^cpu / {print $5, $6}' /proc/stat 2>/dev/null)
+        read_idle2=$(awk '/^cpu / {print $5}' /proc/stat 2>/dev/null)
+        read_iow2=$(awk '/^cpu / {print $6}' /proc/stat 2>/dev/null)
         read_total2=$(awk '/^cpu / {s=0; for(i=2;i<=NF;i++) s+=$i; print s}' /proc/stat 2>/dev/null)
 
-        IOWAIT_PCT=$(awk -v c1="$read_cpu1" -v t1="$read_total1" \
-                         -v c2="$read_cpu2" -v t2="$read_total2" '
-            BEGIN {
-                split(c1,a1," "); split(c2,a2," ")
-                diowait = a2[1] - a1[1]
-                dtotal  = t2 - t1
-                if (dtotal > 0) printf "%.0f", (diowait/dtotal)*100
-                else print "0"
-            }')
-        IOWAIT_PCT=$(( ${IOWAIT_PCT:-0} + 0 ))
+        dtotal=$(( read_total2 - read_total1 ))
+        diowait=$(( read_iow2 - read_iow1 ))
+        IOWAIT_PCT=0
+        [ "$dtotal" -gt 0 ] && IOWAIT_PCT=$(( diowait * 100 / dtotal ))
 
-        MEM_AVAIL=$(awk '/^MemAvailable:/{printf "%.1f", $2/1024/1024}' /proc/meminfo 2>/dev/null)
-        MEM_TOTAL=$(awk '/^MemTotal:/{printf "%.1f", $2/1024/1024}' /proc/meminfo 2>/dev/null)
-        MEM_USED=$(awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{
-            if(t>0) printf "%.0f", ((t-a)/t)*100; else print "0"}' /proc/meminfo 2>/dev/null)
-        MEM_USED=$(( ${MEM_USED:-0} + 0 ))
+        MEM_USED=0; MEM_AVAIL="0"; MEM_TOTAL="0"
+        while read -r key val _; do
+            case "$key" in
+                MemTotal:)     mem_t=$val ;;
+                MemAvailable:) mem_a=$val ;;
+            esac
+        done < /proc/meminfo
+        MEM_TOTAL=$(awk -v t="$mem_t" 'BEGIN{printf "%.1f", t/1024/1024}')
+        MEM_AVAIL=$(awk -v a="$mem_a" 'BEGIN{printf "%.1f", a/1024/1024}')
+        [ "${mem_t:-0}" -gt 0 ] && MEM_USED=$(( (mem_t - mem_a) * 100 / mem_t ))
 
-        SWAP_USED=$(awk '/^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{
-            used=(t-f)/1024; printf "%.0fM", used}' /proc/meminfo 2>/dev/null)
-        SWAP_TOTAL=$(awk '/^SwapTotal:/{printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null)
+        SWAP_USED="0M"
+        read -r sw_total sw_free < <(awk '/^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{print t+0, f+0}' /proc/meminfo 2>/dev/null)
+        SWAP_USED="$(( (sw_total - sw_free) / 1024 ))M"
 
-        SWAP_IN=0; SWAP_OUT=0
-        if command -v vmstat &>/dev/null; then
-            vmstat_line=$(vmstat 1 2 2>/dev/null | tail -1)
-            SWAP_IN=$(echo  "$vmstat_line" | awk '{print $7+0}')
-            SWAP_OUT=$(echo "$vmstat_line" | awk '{print $8+0}')
-        fi
-        SWAP_IN=$(( ${SWAP_IN:-0} + 0 ))
-        SWAP_OUT=$(( ${SWAP_OUT:-0} + 0 ))
+        DSTATE=$(ps -eo stat 2>/dev/null | grep -c '^D')
+        DSTATE=$(to_int "$DSTATE")
+        OOM_COUNT=$(dmesg 2>/dev/null | tail -100 | grep -c "Out of memory\|oom-kill")
+        OOM_COUNT=$(to_int "$OOM_COUNT")
 
-        DSTATE=$(ps -eo stat 2>/dev/null | grep -c '^D' | tr -d '[:space:]')
-        DSTATE=$(( ${DSTATE:-0} + 0 ))
-
-        OOM_COUNT=$(dmesg 2>/dev/null | tail -n 100 | grep -c "Out of memory\|oom-kill" | tr -d '[:space:]')
-        OOM_COUNT=$(( ${OOM_COUNT:-0} + 0 ))
-
+        # Color selection (no subshell)
         iowait_col="${GREEN_S}"
         [ "$IOWAIT_PCT" -ge 20 ] && iowait_col="${ORANGE}"
         [ "$IOWAIT_PCT" -ge 50 ] && iowait_col="${RED}${BOLD}"
-
         mem_col="${GREEN_S}"
         [ "$MEM_USED" -ge 80 ] && mem_col="${ORANGE}"
         [ "$MEM_USED" -ge 95 ] && mem_col="${RED}${BOLD}"
-
-        swap_col="${GREEN_S}"
-        [ "$SWAP_OUT" -ge 10 ] && swap_col="${ORANGE}"
-        [ "$SWAP_OUT" -ge 50 ] && swap_col="${RED}${BOLD}"
-
-        dstate_col="${GREEN_S}"
-        [ "$DSTATE" -ge 3  ] && dstate_col="${ORANGE}"
-        [ "$DSTATE" -ge 10 ] && dstate_col="${RED}${BOLD}"
-
         oom_col="${GREEN_S}"
         [ "$OOM_COUNT" -ge 1 ] && oom_col="${RED}${BOLD}${BLINK}"
 
-        printf "${CYAN}${BOLD}  ▶  SYSTEM PRESSURE${R}"
-
-        if [ "$IOWAIT_PCT" -ge 50 ] || [ "$MEM_USED" -ge 95 ] || \
-           [ "$DSTATE"     -ge 10 ] || [ "$OOM_COUNT" -ge 1 ]; then
-            printf "  ${BG_ALERT}${RED}${BOLD}${BLINK} ⚠ HIGH LOAD DETECTED ${R}"
+        printf "${CYAN}${BOLD}  SYSTEM PRESSURE${R}"
+        if [ "$IOWAIT_PCT" -ge 50 ] || [ "$MEM_USED" -ge 95 ] || [ "$OOM_COUNT" -ge 1 ]; then
+            printf "  ${BG_ALERT}${RED}${BOLD}${BLINK} HIGH LOAD ${R}"
         fi
         printf "\n"
-
-        printf "  ${DGRAY}CPU iowait:${R} ${iowait_col}${BOLD}%-6s%%${R}  " "${IOWAIT_PCT}"
-        printf "${DGRAY}Mem used:${R} ${mem_col}${BOLD}%-4s%%${R} ${DGRAY}(${R}${WHITE}${MEM_AVAIL:-0}G avail / ${MEM_TOTAL:-0}G${R}${DGRAY})${R}  "
-        printf "${DGRAY}Swap:${R} ${swap_col}${BOLD}%-6s${R}  "  "${SWAP_USED:-0M}"
-        printf "${DGRAY}Swap I/O in/out:${R} ${swap_col}${BOLD}%s/%s KB/s${R}  " "$SWAP_IN" "$SWAP_OUT"
-        printf "${DGRAY}D-state procs:${R} ${dstate_col}${BOLD}%s${R}  " "$DSTATE"
-        printf "${DGRAY}OOM kills:${R} ${oom_col}${BOLD}%s${R}\n" "$OOM_COUNT"
+        printf "  ${DGRAY}iowait:${R} ${iowait_col}${BOLD}%s%%${R}  " "${IOWAIT_PCT}"
+        printf "${DGRAY}mem:${R} ${mem_col}${BOLD}%s%%${R} (${WHITE}${MEM_AVAIL}G/${MEM_TOTAL}G${R})  " "$MEM_USED"
+        printf "${DGRAY}swap:${R} ${WHITE}${BOLD}%s${R}  " "$SWAP_USED"
+        printf "${DGRAY}D-state:${R} ${WHITE}${BOLD}%s${R}  " "$DSTATE"
+        printf "${DGRAY}OOM:${R} ${oom_col}${BOLD}%s${R}\n" "$OOM_COUNT"
     }
-    hline '─' "$DGRAY"
-
-
-    # ── _ip_enrich ip ────────────────────────────────────────────────────
-# Queries AbuseIPDB (abuse score) + ip-api.com (country + ISP).
-# Results cached in $ABUSEIPDB_CACHE as:  ip|score|cc|isp
-#
-# Called at most once per unique IP per script run.
-# Every subsequent call for the same IP is a pure grep — no network.
-# Safe to call from any block, any subshell (writes to file not a var).
-#
-# If ABUSEIPDB_KEY is empty, score is "-" but geo still works.
-# If no network, both fields fall back to "-" / "--" gracefully.
-_ip_enrich() {
-    local ip="$1"
-
-    # Return cached result immediately — no API call
-    local cached
-    cached=$(grep "^${ip}|" "$ABUSEIPDB_CACHE" 2>/dev/null | head -1)
-    if [ -n "$cached" ]; then
-        echo "$cached"; return
-    fi
-
-    # Skip RFC-1918 / loopback — pointless to look these up
-    local oct1 oct2
-    oct1=$(echo "$ip" | cut -d. -f1)
-    oct2=$(echo "$ip" | cut -d. -f2)
-    case "${oct1}.${oct2}" in
-        10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|192.168.*|127.*|0.*)
-            echo "${ip}|-|--|private" >> "$ABUSEIPDB_CACHE"
-            echo "${ip}|-|--|private"; return ;;
-    esac
-
-    # ── 1. AbuseIPDB — confidence score 0-100 ────────────────────────
-    local score="-"
-    if [ -n "$ABUSEIPDB_KEY" ]; then
-        local abuse_raw
-        abuse_raw=$(curl -sS --max-time 3 -G "https://api.abuseipdb.com/api/v2/check" \
-            --data-urlencode "ipAddress=${ip}" \
-            -d "maxAgeInDays=90" \
-            -H "Key: ${ABUSEIPDB_KEY}" \
-            -H "Accept: application/json" 2>/dev/null)
-        score=$(echo "$abuse_raw" | grep -oP '"abuseConfidenceScore"\s*:\s*\K[0-9]+')
-        score="${score:--}"
-    fi
-
-    # ── 2. ip-api.com — country code + ISP (free, no key needed) ─────
-    # HTTP only on free tier — no sensitive data in request so that's fine
-    local geo_raw cc isp
-    geo_raw=$(curl -sS --max-time 3 \
-        "http://ip-api.com/json/${ip}?fields=countryCode,isp,org" 2>/dev/null)
-    cc=$(echo  "$geo_raw" | grep -oP '"countryCode"\s*:\s*"\K[^"]+')
-    isp=$(echo "$geo_raw" | grep -oP '"isp"\s*:\s*"\K[^"]+')
-    [ -z "$isp" ] && \
-        isp=$(echo "$geo_raw" | grep -oP '"org"\s*:\s*"\K[^"]+')  # fallback to org
-    cc="${cc:---}"
-    isp="${isp:--}"
-    [ "${#isp}" -gt 24 ] && isp="${isp:0:23}…"   # truncate to fit column
-
-    local result="${ip}|${score}|${cc}|${isp}"
-    echo "$result" >> "$ABUSEIPDB_CACHE"
-    echo "$result"
-}
-
-# ── _abuse_colour score ───────────────────────────────────────────────
-# Prints the ANSI colour code for a given abuse score.
-# Read-only — safe to call from any subshell.
-_abuse_colour() {
-    local score="$1"
-    if [[ "$score" =~ ^[0-9]+$ ]]; then
-        if   [ "$score" -ge 75 ]; then printf '%s' "${RED}${BOLD}"
-        elif [ "$score" -ge 25 ]; then printf '%s' "${ORANGE}"
-        else                           printf '%s' "${GREEN_S}"
-        fi
-    else
-        printf '%s' "${DGRAY}"
-    fi
-}
-
-
-
+    hline '-' "$DGRAY"
 
     # ════════════════════════════════════════════
     #  BLOCK 1: CPU (left) | Memory (right)
@@ -1407,234 +895,142 @@ _abuse_colour() {
     C1=$(mktemp); C2=$(mktemp)
 
     {
-        printf "${YELLOW}${BOLD}  ▶  TOP CPU PROCESSES${R}\n"
-        printf "  ${DGRAY}%-${COL_PROC_N}s %-${COL_PROC_NAME}s %s${R}\n" "#" "PROCESS" "CPU%"
-        printf "  ${DGRAY}%-${COL_PROC_N}s %-${COL_PROC_NAME}s %s${R}\n" "──" "─────────────────────────" "────"
+        printf "${YELLOW}${BOLD}  TOP CPU PROCESSES${R}\n"
+        printf "  ${DGRAY}%-4s %-26s %s${R}\n" "#" "PROCESS" "CPU%"
+        printf "  ${DGRAY}%-4s %-26s %s${R}\n" "--" "-------------------------" "----"
         n=0
         ps -eo comm,%cpu --sort=-%cpu 2>/dev/null | awk 'NR>1&&NR<=7{print $1,$2}' | \
         while read -r proc pct; do
             n=$((n+1))
             pc=$(color_pct "$pct" 50 20)
-            printf "  ${GRAY}%2d${R}  ${WHITE}%-${COL_PROC_NAME}.${COL_PROC_NAME}s${R}  ${pc}%s%%${R}\n" \
-                "$n" "$proc" "$pct"
+            printf "  ${GRAY}%2d${R}  ${WHITE}%-26.26s${R}  ${pc}%s%%${R}\n" "$n" "$proc" "$pct"
         done
     } > "$C1"
 
     {
-        printf "${YELLOW}${BOLD}  ▶  TOP MEMORY PROCESSES${R}\n"
-        printf "  ${DGRAY}%-${COL_PROC_N}s %-${COL_PROC_NAME}s %s${R}\n" "#" "PROCESS" "MEM%"
-        printf "  ${DGRAY}%-${COL_PROC_N}s %-${COL_PROC_NAME}s %s${R}\n" "──" "─────────────────────────" "────"
+        printf "${YELLOW}${BOLD}  TOP MEMORY PROCESSES${R}\n"
+        printf "  ${DGRAY}%-4s %-26s %s${R}\n" "#" "PROCESS" "MEM%"
+        printf "  ${DGRAY}%-4s %-26s %s${R}\n" "--" "-------------------------" "----"
         m=0
         ps -eo comm,%mem --sort=-%mem 2>/dev/null | awk 'NR>1&&NR<=7{print $1,$2}' | \
         while read -r proc pct; do
             m=$((m+1))
             mc=$(color_pct "$pct" 20 10)
-            printf "  ${GRAY}%2d${R}  ${WHITE}%-${COL_PROC_NAME}.${COL_PROC_NAME}s${R}  ${mc}%s%%${R}\n" \
-                "$m" "$proc" "$pct"
+            printf "  ${GRAY}%2d${R}  ${WHITE}%-26.26s${R}  ${mc}%s%%${R}\n" "$m" "$proc" "$pct"
         done
     } > "$C2"
 
     render_two_cols "$C1" "$C2"
     rm -f "$C1" "$C2"
-    hline '─' "$DGRAY"
+    hline '-' "$DGRAY"
 
     # ════════════════════════════════════════════
     #  BLOCK 2: Top URLs (left) | Top IPs (right)
+    #  FIX: v2 had IPs duplicated on both sides
     # ════════════════════════════════════════════
     C1=$(mktemp); C2=$(mktemp)
 
+    # LEFT: Top URLs
     {
-        printf "${CYAN}${BOLD}  ▶  TOP IPs & TRAFFIC SPIKES${R}\n"
+        printf "${CYAN}${BOLD}  TOP URLs${R}\n"
+        printf "  ${DGRAY}%-8s  %-20s  %s${R}\n" "HITS" "DOMAIN" "URL"
+        printf "  ${DGRAY}%-8s  %-20s  %s${R}\n" "--------" "--------------------" "--------------------"
 
-        # Column widths — extended to fit CC, ABUSE, ISP
-        COL_IP_HITS=8
-        COL_IP_ADDR=20
-        COL_IP_CC=4
-        COL_IP_ABUSE=6
-        COL_IP_ISP=24
-        COL_IP_DELTA=12
-
-        printf "  ${DGRAY}%-${COL_IP_HITS}s  %-${COL_IP_CC}s  %-${COL_IP_ABUSE}s  %-${COL_IP_ADDR}s  %-${COL_IP_ISP}s  %s${R}\n" \
-            "HITS" "CC" "ABUSE" "IP ADDRESS" "ISP" "Δ CHANGE"
-        printf "  ${DGRAY}%-${COL_IP_HITS}s  %-${COL_IP_CC}s  %-${COL_IP_ABUSE}s  %-${COL_IP_ADDR}s  %-${COL_IP_ISP}s  %s${R}\n" \
-            "────────" "────" "──────" \
-            "$(printf '─%.0s' $(seq 1 $COL_IP_ADDR))" \
-            "$(printf '─%.0s' $(seq 1 $COL_IP_ISP))" \
-            "────────────"
-
-        new_state=$(mktemp)
-
-        # Collect top IPs into a temp file first so we can:
-        #   a) prefetch enrichment before entering the while-read subshell
-        #   b) avoid running the log scan twice
-        top_ips_tmp=$(mktemp)
-        for log in $ACCESSLOG_PATH; do
-            [ -f "$log" ] && awk '{print $1}' "$log"
-        done 2>/dev/null | sort | uniq -c | sort -nr | head -8 > "$top_ips_tmp"
-
-        # ── Prefetch enrichment for every IP in this list ─────────────────
-        # Reads from ABUSEIPDB_CACHE if already resolved by BLOCK 5 or any
-        # earlier block — zero extra API calls for IPs already seen.
-        # Only truly new IPs (not yet in cache) trigger a curl call here.
-        while read -r count ip; do
-            [ -z "$ip" ] && continue
-            _ip_enrich "$ip" > /dev/null
-        done < "$top_ips_tmp"
-
-        # ── Render rows — all lookups are now pure cache reads ─────────────
-        while read -r count ip; do
-            [ -z "$ip" ] && continue
-            count=$(( ${count:-0} + 0 ))
-            echo "$ip $count" >> "$new_state"
-
-            # Pull enrichment from cache file (no curl possible here)
-            entry=$(grep "^${ip}|" "$ABUSEIPDB_CACHE" 2>/dev/null | head -1)
-            lscore=$(echo "$entry" | cut -d'|' -f2); lscore="${lscore:--}"
-            lcc=$(echo    "$entry" | cut -d'|' -f3); lcc="${lcc:---}"
-            lisp=$(echo   "$entry" | cut -d'|' -f4); lisp="${lisp:--}"
-
-            # Colour the abuse score
-            if [[ "$lscore" =~ ^[0-9]+$ ]]; then
-                if   [ "$lscore" -ge 75 ]; then acol="${RED}${BOLD}"
-                elif [ "$lscore" -ge 25 ]; then acol="${ORANGE}"
-                else                            acol="${GREEN_S}"
-                fi
-            else
-                acol="${DGRAY}"
-            fi
-
-            # Delta vs last refresh
-            prev=$(grep "^$ip " "$IP_STATE_FILE" 2>/dev/null | awk '{print $2+0}' | tr -d '[:space:]')
-            prev=$(( ${prev:-0} + 0 ))
-            if [ "$prev" -gt 0 ]; then
-                diff=$(( count - prev ))
-                if   [ "$diff" -gt 100 ]; then chg="${RED}${BOLD}↑ +${diff}${R}"
-                elif [ "$diff" -gt   0 ]; then chg="${ORANGE}↑ +${diff}${R}"
-                elif [ "$diff" -lt   0 ]; then chg="${GREEN_S}↓ ${diff}${R}"
-                else                           chg="${DGRAY}—${R}"
-                fi
-            else
-                chg="${CYAN}${BOLD}NEW${R}"
-            fi
-
-            printf "  ${ORANGE}%-${COL_IP_HITS}s${R}  "             "$count"
-            printf "${GRAY}%-${COL_IP_CC}s${R}  "                   "$lcc"
-            printf "${acol}%-${COL_IP_ABUSE}s${R}  "                "$lscore"
-            printf "${CYAN_S}%-${COL_IP_ADDR}.${COL_IP_ADDR}s${R}  " "$ip"
-            printf "${DIM}%-${COL_IP_ISP}.${COL_IP_ISP}s${R}  "     "$lisp"
-            printf "%b\n"                                             "$chg"
-
-        done < "$top_ips_tmp"
-
-        rm -f "$top_ips_tmp"
-        mv "$new_state" "$IP_STATE_FILE" 2>/dev/null
+        if [ -f /tmp/mon_top_urls.dat ]; then
+            head -8 /tmp/mon_top_urls.dat | \
+            while read -r count dom url; do
+                [ -z "$url" ] && continue
+                local short_url="$url"
+                [ "${#url}" -gt 28 ] && short_url="${url:0:27}…"
+                printf "  ${ORANGE}%-8s${R}  ${GREEN_S}%-20.20s${R}  ${YELLOW}%s${R}\n" \
+                    "$count" "$dom" "$short_url"
+            done
+        else
+            printf "  ${GRAY}${DIM}(no data yet)${R}\n"
+        fi
     } > "$C1"
 
-{
-        printf "${CYAN}${BOLD}  ▶  TOP IPs & TRAFFIC SPIKES${R}\n"
+    # RIGHT: Top IPs with enrichment
+    {
+        printf "${CYAN}${BOLD}  TOP IPs & TRAFFIC${R}\n"
+        printf "  ${DGRAY}%-8s  %-4s  %-6s  %-18s  %-12s${R}\n" \
+            "HITS" "CC" "ABUSE" "IP ADDRESS" "DELTA"
+        printf "  ${DGRAY}%-8s  %-4s  %-6s  %-18s  %-12s${R}\n" \
+            "--------" "----" "------" "------------------" "------------"
 
-        # Column widths — extended to fit CC, ABUSE, ISP
-        COL_IP_HITS=8
-        COL_IP_ADDR=20
-        COL_IP_CC=4
-        COL_IP_ABUSE=6
-        COL_IP_ISP=24
-        COL_IP_DELTA=12
+        if [ -f /tmp/mon_top_ips.dat ]; then
+            # Prefetch enrichment for all IPs (one batch)
+            awk '{print $2}' /tmp/mon_top_ips.dat | head -8 > /tmp/mon_ips_to_enrich.tmp
+            _enrich_ips_bulk /tmp/mon_ips_to_enrich.tmp
+            rm -f /tmp/mon_ips_to_enrich.tmp
 
-        printf "  ${DGRAY}%-${COL_IP_HITS}s  %-${COL_IP_CC}s  %-${COL_IP_ABUSE}s  %-${COL_IP_ADDR}s  %-${COL_IP_ISP}s  %s${R}\n" \
-            "HITS" "CC" "ABUSE" "IP ADDRESS" "ISP" "Δ CHANGE"
-        printf "  ${DGRAY}%-${COL_IP_HITS}s  %-${COL_IP_CC}s  %-${COL_IP_ABUSE}s  %-${COL_IP_ADDR}s  %-${COL_IP_ISP}s  %s${R}\n" \
-            "────────" "────" "──────" \
-            "$(printf '─%.0s' $(seq 1 $COL_IP_ADDR))" \
-            "$(printf '─%.0s' $(seq 1 $COL_IP_ISP))" \
-            "────────────"
+            local new_state_file
+            new_state_file=$(mktemp)
 
-        new_state=$(mktemp)
+            head -8 /tmp/mon_top_ips.dat | \
+            while read -r count ip; do
+                [ -z "$ip" ] && continue
+                count=$(to_int "$count")
+                echo "$ip $count" >> "$new_state_file"
 
-        # Collect top IPs into a temp file first so we can:
-        #   a) prefetch enrichment before entering the while-read subshell
-        #   b) avoid running the log scan twice
-        top_ips_tmp=$(mktemp)
-        for log in $ACCESSLOG_PATH; do
-            [ -f "$log" ] && awk '{print $1}' "$log"
-        done 2>/dev/null | sort | uniq -c | sort -nr | head -8 > "$top_ips_tmp"
+                # In-memory cache lookup
+                local cached_data
+                cached_data=$(_ip_get_cached "$ip")
+                local lscore lcc lisp
+                lscore=$(echo "$cached_data" | cut -d'|' -f1)
+                lcc=$(echo "$cached_data" | cut -d'|' -f2)
+                lisp=$(echo "$cached_data" | cut -d'|' -f3)
+                local acol
+                acol=$(_abuse_colour "$lscore")
 
-        # ── Prefetch enrichment for every IP in this list ─────────────────
-        # Reads from ABUSEIPDB_CACHE if already resolved by BLOCK 5 or any
-        # earlier block — zero extra API calls for IPs already seen.
-        # Only truly new IPs (not yet in cache) trigger a curl call here.
-        while read -r count ip; do
-            [ -z "$ip" ] && continue
-            _ip_enrich "$ip" > /dev/null
-        done < "$top_ips_tmp"
-
-        # ── Render rows — all lookups are now pure cache reads ─────────────
-        while read -r count ip; do
-            [ -z "$ip" ] && continue
-            count=$(( ${count:-0} + 0 ))
-            echo "$ip $count" >> "$new_state"
-
-            # Pull enrichment from cache file (no curl possible here)
-            entry=$(grep "^${ip}|" "$ABUSEIPDB_CACHE" 2>/dev/null | head -1)
-            lscore=$(echo "$entry" | cut -d'|' -f2); lscore="${lscore:--}"
-            lcc=$(echo    "$entry" | cut -d'|' -f3); lcc="${lcc:---}"
-            lisp=$(echo   "$entry" | cut -d'|' -f4); lisp="${lisp:--}"
-
-            # Colour the abuse score
-            if [[ "$lscore" =~ ^[0-9]+$ ]]; then
-                if   [ "$lscore" -ge 75 ]; then acol="${RED}${BOLD}"
-                elif [ "$lscore" -ge 25 ]; then acol="${ORANGE}"
-                else                            acol="${GREEN_S}"
+                # Delta
+                local prev chg
+                prev=$(grep "^$ip " "$IP_STATE_FILE" 2>/dev/null | awk '{print $2+0}' | head -1)
+                prev=$(to_int "$prev")
+                if [ "$prev" -gt 0 ]; then
+                    local diff=$(( count - prev ))
+                    if   [ "$diff" -gt 100 ]; then chg="${RED}${BOLD}+${diff}${R}"
+                    elif [ "$diff" -gt   0 ]; then chg="${ORANGE}+${diff}${R}"
+                    elif [ "$diff" -lt   0 ]; then chg="${GREEN_S}${diff}${R}"
+                    else                           chg="${DGRAY}-${R}"
+                    fi
+                else
+                    chg="${CYAN}${BOLD}NEW${R}"
                 fi
-            else
-                acol="${DGRAY}"
-            fi
 
-            # Delta vs last refresh
-            prev=$(grep "^$ip " "$IP_STATE_FILE" 2>/dev/null | awk '{print $2+0}' | tr -d '[:space:]')
-            prev=$(( ${prev:-0} + 0 ))
-            if [ "$prev" -gt 0 ]; then
-                diff=$(( count - prev ))
-                if   [ "$diff" -gt 100 ]; then chg="${RED}${BOLD}↑ +${diff}${R}"
-                elif [ "$diff" -gt   0 ]; then chg="${ORANGE}↑ +${diff}${R}"
-                elif [ "$diff" -lt   0 ]; then chg="${GREEN_S}↓ ${diff}${R}"
-                else                           chg="${DGRAY}—${R}"
-                fi
-            else
-                chg="${CYAN}${BOLD}NEW${R}"
-            fi
+                printf "  ${ORANGE}%-8s${R}  " "$count"
+                printf "${GRAY}%-4s${R}  " "$lcc"
+                printf "${acol}%-6s${R}  " "$lscore"
+                printf "${CYAN_S}%-18.18s${R}  " "$ip"
+                printf "%b\n" "$chg"
+            done
 
-            printf "  ${ORANGE}%-${COL_IP_HITS}s${R}  "             "$count"
-            printf "${GRAY}%-${COL_IP_CC}s${R}  "                   "$lcc"
-            printf "${acol}%-${COL_IP_ABUSE}s${R}  "                "$lscore"
-            printf "${CYAN_S}%-${COL_IP_ADDR}.${COL_IP_ADDR}s${R}  " "$ip"
-            printf "${DIM}%-${COL_IP_ISP}.${COL_IP_ISP}s${R}  "     "$lisp"
-            printf "%b\n"                                             "$chg"
-
-        done < "$top_ips_tmp"
-
-        rm -f "$top_ips_tmp"
-        mv "$new_state" "$IP_STATE_FILE" 2>/dev/null
-    }> "$C2"
+            mv "$new_state_file" "$IP_STATE_FILE" 2>/dev/null
+        else
+            printf "  ${GRAY}${DIM}(no data yet)${R}\n"
+        fi
+    } > "$C2"
 
     render_two_cols "$C1" "$C2"
     rm -f "$C1" "$C2"
-    hline '─' "$DGRAY"
+    hline '-' "$DGRAY"
 
     # ════════════════════════════════════════════
     #  BLOCK 3: Network (left) | WP-Login (right)
     # ════════════════════════════════════════════
     C1=$(mktemp); C2=$(mktemp)
 
+    # LEFT: Network connections
     {
-        printf "${CYAN}${BOLD}  ▶  NETWORK CONNECTIONS${R}\n"
-        printf "  ${DGRAY}%-${COL_NET_STATE}s %s${R}\n" "STATE" "COUNT"
-        printf "  ${DGRAY}%-${COL_NET_STATE}s %s${R}\n" "───────────────────────" "─────"
+        printf "${CYAN}${BOLD}  NETWORK CONNECTIONS${R}\n"
+        printf "  ${DGRAY}%-24s %s${R}\n" "STATE" "COUNT"
+        printf "  ${DGRAY}%-24s %s${R}\n" "-----------------------" "-----"
         netstat -ant 2>/dev/null | awk '{print $6}' \
             | grep -v 'State\|Foreign\|^$' \
             | sort | uniq -c | sort -nr | head -8 | \
         while read -r cnt state; do
             [ -z "$state" ] && continue
+            local sc
             case "$state" in
                 ESTABLISHED) sc="${GREEN}" ;;
                 SYN_RECV)    sc="${RED}${BOLD}" ;;
@@ -1644,596 +1040,375 @@ _abuse_colour() {
                 FIN_WAIT*)   sc="${MAGENTA}" ;;
                 *)           sc="${GRAY}" ;;
             esac
-            printf "  ${sc}%-${COL_NET_STATE}s${R}  ${WHITE}%s${R}\n" "$state" "$cnt"
+            printf "  ${sc}%-24s${R}  ${WHITE}%s${R}\n" "$state" "$cnt"
         done
 
-        # ── SYN_RECV detail ───────────────────────────────────────────────
-        # Collect all SYN_RECV rows once into a temp var — avoids running
-        # netstat twice and keeps the flood check + IP breakdown consistent.
+        # SYN_RECV detail
+        local syn_raw syn_count
         syn_raw=$(netstat -ant 2>/dev/null | grep "SYN_RECV")
-        syn_count=$(echo "$syn_raw" | grep -c "SYN_RECV" | tr -d '[:space:]')
-        syn_count=$(( ${syn_count:-0} + 0 ))
+        syn_count=$(echo "$syn_raw" | grep -c "SYN_RECV")
+        syn_count=$(to_int "$syn_count")
 
-        if [ "$syn_count" -gt 0 ]; then
-
-            # Column widths for the SYN IP table
-            COL_SYN_CNT=6
-            COL_SYN_IP=20
-            COL_SYN_PORT=8
-            COL_SYN_FLAG=12    # "FLOOD" warning label
-
-            if [ "$syn_count" -gt 20 ]; then
-                printf "\n  ${RED}${BOLD}${BLINK}⚠ SYN FLOOD DETECTED: %s active SYN_RECV connections${R}\n" "$syn_count"
-            else
-                printf "\n  ${ORANGE}${BOLD}⚠ SYN_RECV: %s active connections${R}\n" "$syn_count"
-            fi
-
-            printf "\n  ${DGRAY}%-${COL_SYN_CNT}s  %-${COL_SYN_IP}s  %-${COL_SYN_PORT}s  %s${R}\n" \
-                "HITS" "SOURCE IP" "DST PORT" "STATUS"
-            printf "  ${DGRAY}%-${COL_SYN_CNT}s  %-${COL_SYN_IP}s  %-${COL_SYN_PORT}s  %s${R}\n" \
-                "──────" "────────────────────" "────────" "──────────────"
-
-            # Extract source IP and destination port from SYN_RECV rows,
-            # count per IP, sort by count descending.
-            # netstat -ant columns: Proto Recv-Q Send-Q Local-Addr Foreign-Addr State
-            # Foreign-Addr is the SYN source:  ip:port  →  we want just the ip
+        if [ "$syn_count" -gt 20 ]; then
+            printf "\n  ${RED}${BOLD}${BLINK}SYN FLOOD: %s SYN_RECV${R}\n" "$syn_count"
             echo "$syn_raw" | awk '{
-                foreign = $5
-                # strip port — handle both ip:port and [ipv6]:port
-                sub(/:[^:]+$/, "", foreign)
-                gsub(/[\[\]]/, "", foreign)   # strip IPv6 brackets
-                dst = $4
-                sub(/.*:/, "", dst)           # keep only the destination port
+                foreign=$5; sub(/:[^:]+$/,"",foreign); gsub(/[\[\]]/,"",foreign)
+                dst=$4; sub(/.*:/,"",dst)
                 print foreign, dst
-            }' | sort | uniq -c | sort -nr | head -20 | \
+            }' | sort | uniq -c | sort -nr | head -10 | \
             while read -r cnt src_ip dst_port; do
                 [ -z "$src_ip" ] && continue
-                cnt=$(echo "$cnt" | tr -d '[:space:]')
-                cnt=$(( ${cnt:-0} + 0 ))
-
-                # Flag IPs appearing more than 5 times — likely spoofed/flood source
+                local flag ip_col
                 if [ "$cnt" -gt 5 ]; then
-                    flag="${RED}${BOLD}⚠ FLOOD${R}"
-                    ip_col="${RED}${BOLD}"
-                    cnt_col="${RED}${BOLD}"
+                    flag="${RED}${BOLD}FLOOD${R}"; ip_col="${RED}${BOLD}"
                 else
-                    flag="${DGRAY}—${R}"
-                    ip_col="${ORANGE}"
-                    cnt_col="${ORANGE}"
+                    flag="${DGRAY}-${R}"; ip_col="${ORANGE}"
                 fi
-
-                printf "  ${cnt_col}%-${COL_SYN_CNT}s${R}  " "$cnt"
-                printf "${ip_col}%-${COL_SYN_IP}s${R}  "     "$src_ip"
-                printf "${GRAY}%-${COL_SYN_PORT}s${R}  "     "$dst_port"
-                printf "%b\n"                                 "$flag"
+                printf "  ${ip_col}%-6s  %-18s${R}  ${GRAY}%-8s${R}  %b\n" "$cnt" "$src_ip" "$dst_port" "$flag"
             done
-
-            # Summary line — unique source IPs
-            unique_syn_ips=$(echo "$syn_raw" | awk '{print $5}' | \
-                sed 's/:[^:]*$//' | sort -u | grep -c "." | tr -d '[:space:]')
-            printf "\n  ${DGRAY}Unique source IPs in SYN_RECV: ${WHITE}%s${R}\n" \
-                "${unique_syn_ips:-0}"
+        elif [ "$syn_count" -gt 0 ]; then
+            printf "\n  ${ORANGE}SYN_RECV: %s active${R}\n" "$syn_count"
         fi
     } > "$C1"
 
+    # RIGHT: WP-Login monitor
     {
+        local WL_NOW WL_CUR_MIN WL_PREV_MIN
         WL_NOW=$(date "+%H:%M:%S")
         WL_CUR_MIN=$(date "+%d/%b/%Y:%H:%M")
         WL_PREV_MIN=$(date -d "1 minute ago" "+%d/%b/%Y:%H:%M" 2>/dev/null || \
                       date -v-1M "+%d/%b/%Y:%H:%M" 2>/dev/null)
 
-        # ── Collect all wp-login.php lines from every access log ──────────
-        # Store as a temp file instead of a variable — large log grep output
-        # in a variable can silently truncate or cause word-splitting issues.
-        WL_TMP=$(mktemp)
-        for log in $ACCESSLOG_PATH; do
-            [ -f "$log" ] || continue
-            dom=$(echo "$log" | awk -F'/' '{print $5}')
-            grep "wp-login.php" "$log" 2>/dev/null | awk -v d="$dom" '{
-                ip     = $1
-                ts     = $4; gsub(/\[/, "", ts)
-                method = $6; gsub(/"/, "", method)
-                status = $9
-                print d, ip, ts, method, status
-            }' >> "$WL_TMP"
-        done
+        # Use pre-extracted wp-login data
+        local WL_TMP="/tmp/mon_wplogin.dat"
+        local wplogin_total=0 wplogin_recent=0
 
-        # ── Strip monitoring/trusted IPs from results ────────────────────
-        # Define these near the top of the main script alongside your other
-        # config variables:
-        #
-        #   WL_EXCLUDE_IPS="2607:5300:205:200::6cbe 57.128.189.19"
-        #
-        # Space-separated list — IPv4 and IPv6 both supported.
-        # The filter runs once on WL_TMP before any counting or rendering,
-        # so excluded IPs disappear from totals, the live table, and reports.
-        if [ -n "${WL_EXCLUDE_IPS:-}" ]; then
-            # Build a grep -F pattern: one literal IP per line
-            exclude_pattern=$(printf '%s
-' $WL_EXCLUDE_IPS)
-            # Column 2 of WL_TMP is the IP — grep -v removes matching lines
-            grep_tmp=$(mktemp)
-            while IFS= read -r excl_ip; do
-                [ -z "$excl_ip" ] && continue
-                grep -v "^[^ ]*  *${excl_ip} " "$WL_TMP" > "$grep_tmp"                     && mv "$grep_tmp" "$WL_TMP"
-            done <<< "$exclude_pattern"
-            rm -f "$grep_tmp"
+        if [ -f "$WL_TMP" ]; then
+            # Apply exclusions if configured
+            if [ -n "$WL_EXCLUDE_IPS" ]; then
+                local filtered_wl
+                filtered_wl=$(mktemp)
+                cp "$WL_TMP" "$filtered_wl"
+                for excl_ip in $WL_EXCLUDE_IPS; do
+                    grep -v " ${excl_ip} " "$filtered_wl" > "${filtered_wl}.tmp" && \
+                        mv "${filtered_wl}.tmp" "$filtered_wl"
+                done
+                wplogin_total=$(wc -l < "$filtered_wl" | tr -d '[:space:]')
+                wplogin_recent=$(grep -c "${WL_CUR_MIN}\|${WL_PREV_MIN}" "$filtered_wl" 2>/dev/null)
+                # Use filtered file for rendering
+                WL_TMP="$filtered_wl"
+            else
+                wplogin_total=$(wc -l < "$WL_TMP" | tr -d '[:space:]')
+                wplogin_recent=$(grep -c "${WL_CUR_MIN}\|${WL_PREV_MIN}" "$WL_TMP" 2>/dev/null)
+            fi
         fi
+        wplogin_total=$(to_int "$wplogin_total")
+        wplogin_recent=$(to_int "$wplogin_recent")
 
-        # ── Counts ────────────────────────────────────────────────────────
-        wplogin_total=$(wc -l < "$WL_TMP" | tr -d '[:space:]')
-        wplogin_total=$(( ${wplogin_total:-0} + 0 ))
-
-        wplogin_recent=$(grep -c "${WL_CUR_MIN}\|${WL_PREV_MIN}" "$WL_TMP" 2>/dev/null | tr -d '[:space:]')
-        wplogin_recent=$(( ${wplogin_recent:-0} + 0 ))
-
-        # ── Status indicator ──────────────────────────────────────────────
+        # Status indicator
+        local status_dot status_label
         if [ "$wplogin_recent" -gt 0 ]; then
-            status_dot="${RED}${BOLD}${BLINK}●${R}"
-            status_label="${RED}${BOLD}${BLINK}  ⚠  WP-LOGIN.PHP — ACTIVE ATTACK${R}"
+            status_dot="${RED}${BOLD}${BLINK}*${R}"
+            status_label="${RED}${BOLD}  WP-LOGIN — ACTIVE${R}"
         elif [ "$wplogin_total" -gt 0 ]; then
-            status_dot="${ORANGE}${BOLD}●${R}"
-            status_label="${ORANGE}${BOLD}  ⚠  WP-LOGIN.PHP — PRIOR HITS${R}"
+            status_dot="${ORANGE}${BOLD}*${R}"
+            status_label="${ORANGE}${BOLD}  WP-LOGIN — PRIOR HITS${R}"
         else
-            status_dot="${GREEN_S}●${R}"
-            status_label="${GREEN_S}${BOLD}  ✔  WP-LOGIN.PHP — CLEAR${R}"
+            status_dot="${GREEN_S}*${R}"
+            status_label="${GREEN_S}${BOLD}  WP-LOGIN — CLEAR${R}"
         fi
 
-        label_vis="  WP-LOGIN.PHP MONITOR"
-        time_str="as of ${WL_NOW}"
-        pad=$(( HALF - ${#label_vis} - ${#time_str} - 4 ))
-        [ "$pad" -lt 1 ] && pad=1
-        printf "  %b ${DGRAY}WP-LOGIN.PHP MONITOR%*s${DIM}%s${R}\n" \
-            "$status_dot" "$pad" "" "$time_str"
+        printf "  %b ${DGRAY}WP-LOGIN MONITOR${R}  ${DIM}%s${R}\n" "$status_dot" "$WL_NOW"
         printf "%b\n" "$status_label"
 
-        if [ "$wplogin_total" -gt 0 ]; then
-
-            printf "  ${DGRAY}Total hits in log:${R} ${ORANGE}${BOLD}%s${R}  " "$wplogin_total"
-            printf "${DGRAY}Active (last 2m):${R} "
+        if [ "$wplogin_total" -gt 0 ] && [ -f "$WL_TMP" ]; then
+            printf "  ${DGRAY}Total:${R} ${ORANGE}${BOLD}%s${R}  " "$wplogin_total"
+            printf "${DGRAY}Active (2m):${R} "
             if [ "$wplogin_recent" -gt 0 ]; then
-                printf "${RED}${BOLD}${BLINK}%s${R}\n" "$wplogin_recent"
+                printf "${RED}${BOLD}%s${R}\n" "$wplogin_recent"
             else
                 printf "${GREEN_S}0${R}\n"
             fi
 
-            # ── Column widths ─────────────────────────────────────────────
-            COL_WL_HITS=6
-            COL_WL_CC=4
-            COL_WL_ABUSE=6
-            COL_WL_IP=20
-            COL_WL_ISP=24
-            COL_WL_DOM=20
-            COL_WL_METHOD=7
-            COL_WL_STATUS=4
-            COL_WL_TS=20
+            printf "\n  ${DGRAY}%-6s  %-4s  %-6s  %-18s  %-18s  %s${R}\n" \
+                "HITS" "CC" "ABUSE" "IP" "DOMAIN" "METHOD"
+            printf "  ${DGRAY}%-6s  %-4s  %-6s  %-18s  %-18s  %s${R}\n" \
+                "------" "----" "------" "------------------" "------------------" "------"
 
-            printf "\n"
-            printf "  ${DGRAY}%-${COL_WL_HITS}s  %-${COL_WL_CC}s  %-${COL_WL_ABUSE}s  %-${COL_WL_IP}s  %-${COL_WL_ISP}s  %-${COL_WL_DOM}s  %-${COL_WL_METHOD}s  %-${COL_WL_STATUS}s  %s${R}\n" \
-                "HITS" "CC" "ABUSE" "IP ADDRESS" "ISP" "DOMAIN" "METHOD" "ST" "LAST SEEN"
-            printf "  ${DGRAY}%-${COL_WL_HITS}s  %-${COL_WL_CC}s  %-${COL_WL_ABUSE}s  %-${COL_WL_IP}s  %-${COL_WL_ISP}s  %-${COL_WL_DOM}s  %-${COL_WL_METHOD}s  %-${COL_WL_STATUS}s  %s${R}\n" \
-                "──────" "────" "──────" \
-                "$(printf '─%.0s' $(seq 1 $COL_WL_IP))" \
-                "$(printf '─%.0s' $(seq 1 $COL_WL_ISP))" \
-                "$(printf '─%.0s' $(seq 1 $COL_WL_DOM))" \
-                "───────" "────" "────────────────────"
-
-            # ── Aggregate: hits per domain+ip+method, keep latest timestamp ─
-            # Pure awk — no grep/sort pipeline fragility, works on the clean
-            # temp file where each line is already:  domain ip ts method status
+            # Aggregate
+            local AGG_TMP
             AGG_TMP=$(mktemp)
             awk '{
-                dom=$1; ip=$2; ts=$3; meth=$4; status=$5
-                key = dom SUBSEP ip SUBSEP meth SUBSEP status
+                key=$1 SUBSEP $2 SUBSEP $4 SUBSEP $5
                 count[key]++
-                # keep the most recent timestamp (lexicographic sort works for
-                # dd/Mon/YYYY:HH:MM:SS format)
-                if (ts > last_ts[key]) last_ts[key] = ts
-            }
-            END {
-                for (k in count) {
-                    split(k, f, SUBSEP)
-                    print count[k], f[1], f[2], f[3], f[4], last_ts[k]
+                if($3>last[key]) last[key]=$3
+            } END {
+                for(k in count) {
+                    split(k,f,SUBSEP)
+                    print count[k], f[1], f[2], f[3], f[4], last[k]
                 }
             }' "$WL_TMP" | sort -rn > "$AGG_TMP"
 
-            # ── Prefetch enrichment for every unique IP in the list ────────
-            while read -r _hits _dom ip _rest; do
-                [ -z "$ip" ] && continue
-                _ip_enrich "$ip" > /dev/null
-            done < "$AGG_TMP"
+            # Prefetch enrichment
+            awk '{print $3}' "$AGG_TMP" | sort -u > /tmp/mon_wl_ips.tmp
+            _enrich_ips_bulk /tmp/mon_wl_ips.tmp
+            rm -f /tmp/mon_wl_ips.tmp
 
-            # ── Render rows ────────────────────────────────────────────────
-            head -10 "$AGG_TMP" | \
+            head -8 "$AGG_TMP" | \
             while read -r hits dom ip method status ts; do
                 [ -z "$ip" ] && continue
-                hits=$(( ${hits:-0} + 0 ))
-
-                # Enrichment — pure cache read, no API call
-                entry=$(grep "^${ip}|" "$ABUSEIPDB_CACHE" 2>/dev/null | head -1)
-                lscore=$(echo "$entry" | cut -d'|' -f2); lscore="${lscore:--}"
-                lcc=$(echo    "$entry" | cut -d'|' -f3); lcc="${lcc:---}"
-                lisp=$(echo   "$entry" | cut -d'|' -f4); lisp="${lisp:--}"
+                local cached_data lscore lcc acol
+                cached_data=$(_ip_get_cached "$ip")
+                lscore=$(echo "$cached_data" | cut -d'|' -f1)
+                lcc=$(echo "$cached_data" | cut -d'|' -f2)
                 acol=$(_abuse_colour "$lscore")
 
-                # Is this IP active right now?
-                if grep -q "^[^ ]* ${ip} ${WL_CUR_MIN}\|^[^ ]* ${ip} ${WL_PREV_MIN}" "$WL_TMP" 2>/dev/null; then
-                    row_col="${RED}${BOLD}"
-                    active_marker="${RED}${BOLD}${BLINK}● LIVE${R}"
-                else
-                    row_col="${ORANGE}"
-                    active_marker="${DGRAY}──────${R}"
-                fi
+                local mfmt
+                [ "$method" = "POST" ] && mfmt="${RED}${BOLD}POST${R}" || mfmt="${GREEN_S}GET${R}"
 
-                # Method formatting
-                if [ "$method" = "POST" ]; then
-                    mfmt="${RED}${BOLD}POST   ${R}"
-                else
-                    mfmt="${GREEN_S}GET    ${R}"
-                fi
-
-                # Status code colour
-                case "${status:0:1}" in
-                    5) sfmt="${RED}${BOLD}${status}${R}" ;;
-                    4) sfmt="${ORANGE}${status}${R}" ;;
-                    3) sfmt="${YELLOW}${status}${R}" ;;
-                    *) sfmt="${GREEN_S}${status}${R}" ;;
-                esac
-
-                printf "  ${row_col}%-${COL_WL_HITS}s${R}  "              "$hits"
-                printf "${GRAY}%-${COL_WL_CC}s${R}  "                     "$lcc"
-                printf "${acol}%-${COL_WL_ABUSE}s${R}  "                  "$lscore"
-                printf "${CYAN_S}%-${COL_WL_IP}.${COL_WL_IP}s${R}  "     "$ip"
-                printf "${DIM}%-${COL_WL_ISP}.${COL_WL_ISP}s${R}  "      "$lisp"
-                printf "${GREEN_S}%-${COL_WL_DOM}.${COL_WL_DOM}s${R}  "   "$dom"
-                printf "%b  "                                               "$mfmt"
-                printf "%b  "                                               "$sfmt"
-                printf "${GRAY}%-${COL_WL_TS}s${R}  "                     "$ts"
-                printf "%b\n"                                               "$active_marker"
+                printf "  ${ORANGE}%-6s${R}  " "$hits"
+                printf "${GRAY}%-4s${R}  " "$lcc"
+                printf "${acol}%-6s${R}  " "$lscore"
+                printf "${CYAN_S}%-18.18s${R}  " "$ip"
+                printf "${GREEN_S}%-18.18s${R}  " "$dom"
+                printf "%b\n" "$mfmt"
             done
 
             rm -f "$AGG_TMP"
-
         else
-            printf "  ${GREEN_S}No wp-login.php hits in access logs.${R}\n"
+            printf "  ${GREEN_S}No wp-login.php hits detected.${R}\n"
         fi
 
-        rm -f "$WL_TMP"
-    }> "$C2"
+        # Clean up filtered temp if we created one
+        [ -n "$WL_EXCLUDE_IPS" ] && [ -f "$WL_TMP" ] && [ "$WL_TMP" != "/tmp/mon_wplogin.dat" ] && rm -f "$WL_TMP"
+    } > "$C2"
 
     render_two_cols "$C1" "$C2"
     rm -f "$C1" "$C2"
-    hline '─' "$DGRAY"
+    hline '-' "$DGRAY"
+
     # ════════════════════════════════════════════
-    #  BLOCK 7: FILE CHANGES (left) | PHP SLOWLOG (right)
+    #  BLOCK 4: File Changes (left) | PHP Slowlog (right)
     # ════════════════════════════════════════════
     C1=$(mktemp); C2=$(mktemp)
 
     {
+        local CUR_TIME LAST_FILE_SCAN
         CUR_TIME=$(date +%s)
         LAST_FILE_SCAN=$(cat "$FILE_SCAN_TS" 2>/dev/null | tr -d '[:space:]')
-        LAST_FILE_SCAN=$(( ${LAST_FILE_SCAN:-0} + 0 ))
+        LAST_FILE_SCAN=$(to_int "$LAST_FILE_SCAN")
 
         if (( CUR_TIME - LAST_FILE_SCAN > SCAN_INTERVAL )); then
+            # Use find -printf instead of stat per file
             find /home/nginx/domains/*/public/wp-content/{plugins,themes} \
                 -maxdepth 3 -mmin -1440 -type f \
-                \( -name "*.php" -o -name "*.js" \) 2>/dev/null \
-            | while IFS= read -r filepath; do
-                dom=$(echo   "$filepath" | cut -d'/' -f5)
-                ftype=$(echo "$filepath" | cut -d'/' -f8)
-                plugin=$(echo "$filepath" | cut -d'/' -f9)
-                mod=$(stat -c "%y" "$filepath" 2>/dev/null | cut -d'.' -f1)
-                printf "%s\t%s\t%s\t%s\n" "$dom" "$ftype" "$plugin" "$mod"
-            done \
-            | awk -F'\t' '
-            {
-                key = $1 "\t" $2 "\t" $3
-                count[key]++
-                if ($4 > latest[key]) latest[key] = $4
-            }
-            END {
+                \( -name "*.php" -o -name "*.js" \) \
+                -printf '%h\t%Ty-%Tm-%Td %TH:%TM\n' 2>/dev/null | \
+            awk -F'\t' '{
+                # Parse: /home/nginx/domains/DOM/public/wp-content/TYPE/PLUGIN/...
+                n = split($1, parts, "/")
+                if (n >= 9) {
+                    dom = parts[5]; ftype = parts[8]; plugin = parts[9]
+                    key = dom "\t" ftype "\t" plugin
+                    count[key]++
+                    if ($2 > latest[key]) latest[key] = $2
+                }
+            } END {
                 for (k in count) {
                     split(k, p, "\t")
                     printf "%s\t%s\t%s\t%d\t%s\n", p[1], p[2], p[3], count[k], latest[k]
                 }
-            }' \
-            | sort -t$'\t' -k5,5r \
-            | head -12 > "$FILE_CACHE"
-
+            }' | sort -t$'\t' -k5,5r | head -12 > "$FILE_CACHE"
             echo "$CUR_TIME" > "$FILE_SCAN_TS"
         fi
 
-        printf "${ORANGE}${BOLD}  ▶  FILE CHANGES (Last 24h — Scanned every 15m)${R}\n"
-        printf "  ${DGRAY}%-${COL_FC_DOM}s %-${COL_FC_TYPE}s %-${COL_FC_COUNT}s %-${COL_FC_PLUGIN}s %s${R}\n" \
-            "DOMAIN" "TYPE" "FILES" "PLUGIN / THEME" "LAST MODIFIED"
-        printf "  ${DGRAY}%-${COL_FC_DOM}s %-${COL_FC_TYPE}s %-${COL_FC_COUNT}s %-${COL_FC_PLUGIN}s %s${R}\n" \
-            "$(printf '─%.0s' $(seq 1 $COL_FC_DOM))" \
-            "$(printf '─%.0s' $(seq 1 $COL_FC_TYPE))" \
-            "$(printf '─%.0s' $(seq 1 $COL_FC_COUNT))" \
-            "$(printf '─%.0s' $(seq 1 $COL_FC_PLUGIN))" \
-            "───────────────────"
+        printf "${ORANGE}${BOLD}  FILE CHANGES (24h, scan/15m)${R}\n"
+        printf "  ${DGRAY}%-20s %-7s %-6s %-26s %s${R}\n" \
+            "DOMAIN" "TYPE" "FILES" "PLUGIN/THEME" "MODIFIED"
+        printf "  ${DGRAY}%-20s %-7s %-6s %-26s %s${R}\n" \
+            "--------------------" "-------" "------" "--------------------------" "-------------------"
 
         if [ -s "$FILE_CACHE" ]; then
             while IFS=$'\t' read -r dom ftype plugin count modtime; do
-                if [ "$ftype" = "plugins" ]; then
-                    t_col="\033[38;5;45m";  t_label="Plugin"
-                else
-                    t_col="\033[38;5;171m"; t_label="Theme"
-                fi
-                count=$(( ${count:-0} + 0 ))
-                if [ "$count" -gt 5 ]; then
-                    c_col="\033[38;5;214m"
-                else
-                    c_col="\033[38;5;82m"
-                fi
-
-                printf "  \033[38;5;114m%-${COL_FC_DOM}.${COL_FC_DOM}s\033[0m ${t_col}%-${COL_FC_TYPE}s\033[0m ${c_col}%-${COL_FC_COUNT}s\033[0m \033[38;5;220m%-${COL_FC_PLUGIN}.${COL_FC_PLUGIN}s\033[0m \033[38;5;244m%s\033[0m\n" \
+                local t_col t_label c_col
+                [ "$ftype" = "plugins" ] && { t_col="${CYAN}"; t_label="Plugin"; } || { t_col="${MAGENTA}"; t_label="Theme"; }
+                count=$(to_int "$count")
+                [ "$count" -gt 5 ] && c_col="${ORANGE}" || c_col="${GREEN_S}"
+                printf "  ${GREEN_S}%-20.20s${R} ${t_col}%-7s${R} ${c_col}%-6s${R} ${YELLOW}%-26.26s${R} ${GRAY}%s${R}\n" \
                     "$dom" "$t_label" "$count" "$plugin" "$modtime"
             done < "$FILE_CACHE"
         else
-            printf "  ${GRAY}${DIM}(no changes detected in the last 24h)${R}\n"
+            printf "  ${GRAY}${DIM}(no changes in last 24h)${R}\n"
         fi
     } > "$C1"
 
     {
         if [ -f "$SLOWLOG" ]; then
-            printf "${RED_S}${BOLD}  ▶  PHP SLOWLOG — TOP CULPRITS${R}\n"
-            printf "  ${DGRAY}%-${COL_SLOW_COUNT}s %-${COL_SLOW_DOM}s %s${R}\n" "COUNT" "DOMAIN" "PLUGIN"
-            printf "  ${DGRAY}%-${COL_SLOW_COUNT}s %-${COL_SLOW_DOM}s %s${R}\n" "──────" "────────────────────────" "──────────────────────"
+            printf "${RED_S}${BOLD}  PHP SLOWLOG — TOP CULPRITS${R}\n"
+            printf "  ${DGRAY}%-8s %-24s %s${R}\n" "COUNT" "DOMAIN" "PLUGIN"
+            printf "  ${DGRAY}%-8s %-24s %s${R}\n" "--------" "------------------------" "----------------------"
             grep "wp-content/plugins/" "$SLOWLOG" | \
             sed -rn 's/.*\/domains\/([^/]+)\/.*plugins\/([^/ ]+).*/\1 \2/p' | \
             sort | uniq -c | sort -nr | head -8 | \
-            awk -v o="${ORANGE}" -v g="${GREEN_S}" -v rs="${RED_S}" -v r="${R}" \
-                -v sc="$COL_SLOW_COUNT" -v sd="$COL_SLOW_DOM" -v sp="$COL_SLOW_PLUGIN" \
-                '{printf "  %s%-"sc"s%s  %s%-"sd"."sd"s%s  %s%-"sp"."sp"s%s\n", o,$1,r, g,$2,r, rs,$3,r}'
+            while read -r cnt dom plugin; do
+                printf "  ${ORANGE}%-8s${R}  ${GREEN_S}%-24.24s${R}  ${RED_S}%-22.22s${R}\n" "$cnt" "$dom" "$plugin"
+            done
         else
-            printf "${GRAY}${DIM}  ▶  PHP SLOWLOG${R}\n"
-            printf "  ${GRAY}${DIM}(slowlog not found at configured path)${R}\n"
+            printf "${GRAY}${DIM}  PHP SLOWLOG${R}\n"
+            printf "  ${GRAY}${DIM}(not found)${R}\n"
         fi
     } > "$C2"
 
     render_two_cols "$C1" "$C2"
     rm -f "$C1" "$C2"
-    hline '─' "$DGRAY"
+    hline '-' "$DGRAY"
 
-# ════════════════════════════════════════════════
-#  BLOCK 5: LIVE URL HITS — FULL WIDTH
-# ════════════════════════════════════════════════
+    # ════════════════════════════════════════════
+    #  BLOCK 5: LIVE TRAFFIC — FULL WIDTH
+    # ════════════════════════════════════════════
     {
-        LIVE_URL_STATE="/tmp/live_url_ip.state"
-        NEW_LIVE_STATE=$(mktemp)
-        CUR_MIN=$(date "+%d/%b/%Y:%H:%M")
+        printf "${CYAN}${BOLD}  LIVE TRAFFIC${R}  ${DGRAY}(minute: %s)${R}\n" "$CUR_MIN"
 
-        COL_LV_HITS=6
-        COL_LV_DELTA=10
-        COL_LV_CC=4
-        COL_LV_ABUSE=6
-        COL_LV_ISP=24
-        COL_LV_IP=18
-        COL_LV_DOM=20
-        COL_LV_METHOD=6
-        COL_LV_STATUS=6
-        COL_LV_URL=$(( TW - COL_LV_HITS - COL_LV_DELTA - COL_LV_CC - COL_LV_ABUSE - COL_LV_ISP - COL_LV_IP - COL_LV_DOM - COL_LV_METHOD - COL_LV_STATUS - 26 ))
-        [ "$COL_LV_URL" -lt 24 ] && COL_LV_URL=24
+        local LIVE_DATA="/tmp/mon_live_traffic.dat"
 
-        printf "${CYAN}${BOLD}  ▶  LIVE TRAFFIC  ${DGRAY}(current minute window: %s)${R}\n" "$CUR_MIN"
+        if [ -s "$LIVE_DATA" ]; then
+            # Prefetch enrichment for all live IPs
+            awk '{print $2}' "$LIVE_DATA" | sort -u > /tmp/mon_live_ips.tmp
+            _enrich_ips_bulk /tmp/mon_live_ips.tmp
+            rm -f /tmp/mon_live_ips.tmp
 
-        for log in $ACCESSLOG_PATH; do
-            [ -f "$log" ] || continue
-            dom=$(echo "$log" | awk -F'/' '{print $5}')
-            tail -n 500 "$log" | grep "$CUR_MIN" | \
-                awk -v d="$dom" '{
-                    ip=$1
-                    meth=$6; gsub(/\042/,"",meth)
-                    url=$7
-                    status=$9
-                    print d, ip, meth, url, status
-                }' >> "$NEW_LIVE_STATE"
-        done
+            # Sub-section: Top IPs this minute
+            printf "\n  ${CYAN}${DIM}Top IPs this minute${R}\n"
+            printf "  ${DGRAY}%-6s  %-4s  %-6s  %-18s  %-20s  %s${R}\n" \
+                "HITS" "CC" "ABUSE" "IP" "DOMAIN" "DELTA"
+            printf "  ${DGRAY}%-6s  %-4s  %-6s  %-18s  %-20s  %s${R}\n" \
+                "------" "----" "------" "------------------" "--------------------" "--------"
 
-        # ── IP lookup + cache helpers ─────────────────────────────────────
-        #
-        # ABUSEIPDB_CACHE is a flat file: one "ip|score|cc" line per IP.
-        # It lives in /tmp with a PID-unique name and is deleted on EXIT.
-        #
-        # Why a file and not an associative array:
-        #   while-read loops run in subshells — they cannot write back to
-        #   parent-scope variables, so declare -A would lose every write.
-        #   A file is visible to all subshells and persists across loops.
-        #
-        # All API calls happen in _abuseipdb_prefetch (called once per
-        # refresh, before any while-read loop). Both loops below only
-        # ever grep the cache file — zero additional API calls.
+            local vel_new
+            vel_new=$(mktemp)
 
-        # _ip_enrich and _abuse_colour are defined at top-level scope
-        # (before the main loop) so all blocks can call them freely.
-
-        # ── Prefetch: resolve every unique IP before any while-read loop ──
-        # This is the ONLY place curl is ever called. Subsequent lookups
-        # in both loops below are pure grep against the cache file.
-        if [ -s "$NEW_LIVE_STATE" ]; then
-            while read -r ip; do
-                _ip_enrich "$ip" > /dev/null
-            done < <(awk '{print $2}' "$NEW_LIVE_STATE" | sort -u)
-        fi
-
-        if [ -s "$NEW_LIVE_STATE" ]; then
-
-            LIVE_VEL_STATE="/tmp/live_vel_domip.state"
-
-            COL_VS_HITS=6
-            COL_VS_DOM=22
-            COL_VS_IP=18
-            COL_VS_DELTA=12
-            COL_VS_CC=4
-            COL_VS_ABUSE=6
-            COL_VS_ISP=24
-
-            printf "\n  ${CYAN}${DIM}▸  TOP IPs THIS MINUTE${R}  ${DGRAY}domain · ip · country · abuse score · hits · Δ${R}\n"
-            printf "  ${DGRAY}%-${COL_VS_HITS}s  %-${COL_VS_CC}s  %-${COL_VS_ABUSE}s  %-${COL_VS_IP}s  %-${COL_VS_ISP}s  %-${COL_VS_DOM}s  %s${R}\n" \
-                "HITS" "CC" "ABUSE" "IP" "ISP" "DOMAIN" "Δ CHANGE"
-            printf "  ${DGRAY}%-${COL_VS_HITS}s  %-${COL_VS_CC}s  %-${COL_VS_ABUSE}s  %-${COL_VS_IP}s  %-${COL_VS_ISP}s  %-${COL_VS_DOM}s  %s${R}\n" \
-                "──────" "────" "──────" \
-                "$(printf '─%.0s' $(seq 1 $COL_VS_IP))" \
-                "$(printf '─%.0s' $(seq 1 $COL_VS_ISP))" \
-                "$(printf '─%.0s' $(seq 1 $COL_VS_DOM))" \
-                "────────────"
-
-            awk '{print $1, $2}' "$NEW_LIVE_STATE" | \
-            sort | uniq -c | sort -nr | head -10 | \
+            awk '{print $1, $2}' "$LIVE_DATA" | sort | uniq -c | sort -nr | head -10 | \
             while read -r count dom ip; do
                 [ -z "$ip" ] && continue
-                count=$(( ${count:-0} + 0 ))
+                count=$(to_int "$count")
 
-                # Pure cache read — no API call possible here
-                entry=$(grep "^${ip}|" "$ABUSEIPDB_CACHE" 2>/dev/null | head -1)
-                lscore=$(echo "$entry" | cut -d'|' -f2); lscore="${lscore:--}"
-                lcc=$(echo    "$entry" | cut -d'|' -f3); lcc="${lcc:---}"
-                lisp=$(echo   "$entry" | cut -d'|' -f4); lisp="${lisp:--}"
+                local cached_data lscore lcc lisp acol
+                cached_data=$(_ip_get_cached "$ip")
+                lscore=$(echo "$cached_data" | cut -d'|' -f1)
+                lcc=$(echo "$cached_data" | cut -d'|' -f2)
+                lisp=$(echo "$cached_data" | cut -d'|' -f3)
                 acol=$(_abuse_colour "$lscore")
 
-                state_key="${dom}|${ip}"
-                prev=$(grep "^${state_key}=" "$LIVE_VEL_STATE" 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]')
-                prev=$(( ${prev:-0} + 0 ))
+                local state_key="${dom}|${ip}"
+                local prev delta
+                prev=$(grep "^${state_key}=" "$LIVE_VEL_STATE" 2>/dev/null | head -1 | rev | cut -d'=' -f1 | rev)
+                prev=$(to_int "$prev")
 
                 if [ "$prev" -eq 0 ]; then
                     delta="${ORANGE}${BOLD}NEW${R}"
                 else
-                    diff=$(( count - prev ))
-                    if   [ "$diff" -gt 5 ]; then delta="${RED}${BOLD}↑ +${diff}${R}"
-                    elif [ "$diff" -gt 0 ]; then delta="${ORANGE}↑ +${diff}${R}"
-                    elif [ "$diff" -lt 0 ]; then delta="${GREEN_S}↓ ${diff}${R}"
-                    else                          delta="${DGRAY}  —${R}"
+                    local diff=$(( count - prev ))
+                    if   [ "$diff" -gt 5 ]; then delta="${RED}${BOLD}+${diff}${R}"
+                    elif [ "$diff" -gt 0 ]; then delta="${ORANGE}+${diff}${R}"
+                    elif [ "$diff" -lt 0 ]; then delta="${GREEN_S}${diff}${R}"
+                    else                          delta="${DGRAY}-${R}"
                     fi
                 fi
+                echo "${state_key}=${count}" >> "$vel_new"
 
-                echo "${state_key}=${count}" >> "${LIVE_VEL_STATE}.new"
-
-                printf "  ${ORANGE}%-${COL_VS_HITS}s${R}  "             "$count"
-                printf "${GRAY}%-${COL_VS_CC}s${R}  "                   "$lcc"
-                printf "${acol}%-${COL_VS_ABUSE}s${R}  "                "$lscore"
-                printf "${CYAN_S}%-${COL_VS_IP}.${COL_VS_IP}s${R}  "   "$ip"
-                printf "${DIM}%-${COL_VS_ISP}.${COL_VS_ISP}s${R}  "    "$lisp"
-                printf "${GREEN_S}%-${COL_VS_DOM}.${COL_VS_DOM}s${R}  " "$dom"
+                printf "  ${ORANGE}%-6s${R}  " "$count"
+                printf "${GRAY}%-4s${R}  " "$lcc"
+                printf "${acol}%-6s${R}  " "$lscore"
+                printf "${CYAN_S}%-18.18s${R}  " "$ip"
+                printf "${GREEN_S}%-20.20s${R}  " "$dom"
                 printf "%b\n" "$delta"
             done
+            mv "$vel_new" "$LIVE_VEL_STATE" 2>/dev/null
 
-            mv "${LIVE_VEL_STATE}.new" "$LIVE_VEL_STATE" 2>/dev/null
+            # Sub-section: URL breakdown
+            printf "\n  ${CYAN}${DIM}URL breakdown${R}\n"
+            printf "  ${DGRAY}%-6s  %-18s  %-20s  %-6s  %-${COL_LV_URL}s  %s${R}\n" \
+                "HITS" "IP" "DOMAIN" "METH" "URL" "ST"
+            printf "  ${DGRAY}%-6s  %-18s  %-20s  %-6s  %-${COL_LV_URL}s  %s${R}\n" \
+                "------" "------------------" "--------------------" "------" \
+                "$(printf -- '-%.0s' $(seq 1 $COL_LV_URL))" "--"
 
-            printf "\n  ${CYAN}${DIM}▸  URL BREAKDOWN${R}  ${DGRAY}url · ip · cc · abuse · method · status · Δ${R}\n"
-            printf "  ${DGRAY}%-${COL_LV_HITS}s  %-${COL_LV_DELTA}s  %-${COL_LV_CC}s  %-${COL_LV_ABUSE}s  %-${COL_LV_ISP}s  %-${COL_LV_IP}s  %-${COL_LV_DOM}s  %-${COL_LV_METHOD}s  %-${COL_LV_URL}s  %s${R}\n" \
-                "HITS" "Δ CHANGE" "CC" "ABUSE" "ISP" "IP" "DOMAIN" "METH" "URL" "ST"
-            printf "  ${DGRAY}%-${COL_LV_HITS}s  %-${COL_LV_DELTA}s  %-${COL_LV_CC}s  %-${COL_LV_ABUSE}s  %-${COL_LV_ISP}s  %-${COL_LV_IP}s  %-${COL_LV_DOM}s  %-${COL_LV_METHOD}s  %-${COL_LV_URL}s  %s${R}\n" \
-                "──────" "──────────" "────" "──────" \
-                "$(printf '─%.0s' $(seq 1 $COL_LV_ISP))" \
-                "$(printf '─%.0s' $(seq 1 $COL_LV_IP))" \
-                "$(printf '─%.0s' $(seq 1 $COL_LV_DOM))" \
-                "──────" \
-                "$(printf '─%.0s' $(seq 1 $COL_LV_URL))" \
-                "──"
+            local url_new
+            url_new=$(mktemp)
 
-            sort "$NEW_LIVE_STATE" | awk '
-            {
-                key = $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5
+            awk '{
+                key=$1 "\t" $2 "\t" $3 "\t" $4 "\t" $5
                 count[key]++
-            }
-            END {
-                for (k in count) {
-                    print count[k] "\t" k
-                }
-            }' | sort -t$'\t' -k1,1rn | head -20 | \
-
+            } END {
+                for (k in count) print count[k] "\t" k
+            }' "$LIVE_DATA" | sort -t$'\t' -k1,1rn | head -15 | \
             while IFS=$'\t' read -r hits dom ip meth url status; do
                 [ -z "$url" ] && continue
-                hits=$(( ${hits:-0} + 0 ))
+                hits=$(to_int "$hits")
 
-                # Pure cache read — no API call possible here
-                entry=$(grep "^${ip}|" "$ABUSEIPDB_CACHE" 2>/dev/null | head -1)
-                lscore=$(echo "$entry" | cut -d'|' -f2); lscore="${lscore:--}"
-                lcc=$(echo    "$entry" | cut -d'|' -f3); lcc="${lcc:---}"
-                lisp=$(echo   "$entry" | cut -d'|' -f4); lisp="${lisp:--}"
+                local cached_data lscore lcc acol
+                cached_data=$(_ip_get_cached "$ip")
+                lscore=$(echo "$cached_data" | cut -d'|' -f1)
+                lcc=$(echo "$cached_data" | cut -d'|' -f2)
                 acol=$(_abuse_colour "$lscore")
 
-                state_key="${dom}|${ip}|${url}"
-                prev=$(grep "^${state_key}=" "$LIVE_URL_STATE" 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]')
-                prev=$(( ${prev:-0} + 0 ))
-
+                local state_key="${dom}|${ip}|${url}"
+                local prev delta
+                prev=$(grep -F "${state_key}=" "$LIVE_URL_STATE" 2>/dev/null | head -1 | rev | cut -d'=' -f1 | rev)
+                prev=$(to_int "$prev")
                 if [ "$prev" -eq 0 ]; then
                     delta="${ORANGE}${BOLD}NEW${R}"
                 else
-                    diff=$(( hits - prev ))
-                    if   [ "$diff" -gt 0 ]; then delta="${RED}${BOLD}↑ +${diff}${R}"
-                    elif [ "$diff" -lt 0 ]; then delta="${GREEN_S}↓ ${diff}${R}"
-                    else                          delta="${DGRAY}  —${R}"
+                    local diff=$(( hits - prev ))
+                    if   [ "$diff" -gt 0 ]; then delta="${RED}${BOLD}+${diff}${R}"
+                    elif [ "$diff" -lt 0 ]; then delta="${GREEN_S}${diff}${R}"
+                    else                          delta="${DGRAY}-${R}"
                     fi
                 fi
+                echo "${state_key}=${hits}" >> "$url_new"
 
-                echo "${state_key}=${hits}" >> "${LIVE_URL_STATE}.new"
+                local mc sc
+                case "$meth" in POST|PUT|DELETE) mc="${RED_S}" ;; GET) mc="${CYAN_S}" ;; *) mc="${GRAY}" ;; esac
+                case "${status:0:1}" in 5) sc="${RED}${BOLD}" ;; 4) sc="${ORANGE}" ;; 3) sc="${YELLOW}" ;; *) sc="${GREEN_S}" ;; esac
 
-                case "$meth" in
-                    POST|PUT|DELETE) mc="${RED_S}" ;;
-                    GET)             mc="${CYAN_S}" ;;
-                    *)               mc="${GRAY}" ;;
-                esac
+                [ "${#url}" -gt "$COL_LV_URL" ] && url="${url:0:$(( COL_LV_URL - 1 ))}…"
 
-                case "${status:0:1}" in
-                    5) sc="${RED}${BOLD}" ;;
-                    4) sc="${ORANGE}" ;;
-                    3) sc="${YELLOW}" ;;
-                    *) sc="${GREEN_S}" ;;
-                esac
-
-                if [ "${#url}" -gt "$COL_LV_URL" ]; then
-                    url="${url:0:$(( COL_LV_URL - 1 ))}…"
-                fi
-
-                printf "  ${ORANGE}%-${COL_LV_HITS}s${R}  "             "$hits"
-                printf "%-${COL_LV_DELTA}b  "                            "$delta"
-                printf "${GRAY}%-${COL_LV_CC}s${R}  "                   "$lcc"
-                printf "${acol}%-${COL_LV_ABUSE}s${R}  "                "$lscore"
-                printf "${DIM}%-${COL_LV_ISP}.${COL_LV_ISP}s${R}  "    "$lisp"
-                printf "${CYAN_S}%-${COL_LV_IP}.${COL_LV_IP}s${R}  "   "$ip"
-                printf "${GREEN_S}%-${COL_LV_DOM}.${COL_LV_DOM}s${R}  " "$dom"
-                printf "${mc}%-${COL_LV_METHOD}s${R}  "                  "$meth"
-                printf "${YELLOW}%-${COL_LV_URL}s${R}  "                "$url"
-                printf "${sc}%s${R}\n"                                    "$status"
-
+                printf "  ${ORANGE}%-6s${R}  " "$hits"
+                printf "${CYAN_S}%-18.18s${R}  " "$ip"
+                printf "${GREEN_S}%-20.20s${R}  " "$dom"
+                printf "${mc}%-6s${R}  " "$meth"
+                printf "${YELLOW}%-${COL_LV_URL}s${R}  " "$url"
+                printf "${sc}%s${R}\n" "$status"
             done
-
-            mv "${LIVE_URL_STATE}.new" "$LIVE_URL_STATE" 2>/dev/null
-
+            mv "$url_new" "$LIVE_URL_STATE" 2>/dev/null
         else
-            printf "  ${GRAY}${DIM}(no traffic in current minute window — waiting...)${R}\n"
+            printf "  ${GRAY}${DIM}(no traffic in current minute — waiting...)${R}\n"
         fi
-
-        rm -f "$NEW_LIVE_STATE"
     }
-    hline '─' "$DGRAY"
+    hline '-' "$DGRAY"
 
     # ════════════════════════════════════════════
-    #  BLOCK 9: NGINX ERROR LOG MONITOR — FULL WIDTH
+    #  BLOCK 6: NGINX ERROR LOG — FULL WIDTH
     # ════════════════════════════════════════════
     {
-        COL_ERR_SNIPPET=$(( TW - COL_ERR_DOM - COL_ERR_TIME - COL_ERR_DELTA - COL_ERR_CLIENT - COL_ERR_REQ - 16 ))
-        [ "$COL_ERR_SNIPPET" -lt 30 ] && COL_ERR_SNIPPET=30
+        printf "${RED_S}${BOLD}  NGINX ERROR LOG${R}\n"
+        printf "  ${DGRAY}%-20s %-18s %-6s %-16s %-22s %s${R}\n" \
+            "DOMAIN" "LAST SEEN" "NEW" "CLIENT" "REQUEST" "ERROR"
+        printf "  ${DGRAY}%-20s %-18s %-6s %-16s %-22s %s${R}\n" \
+            "--------------------" "------------------" "------" "----------------" "----------------------" \
+            "$(printf -- '-%.0s' $(seq 1 $COL_ERR_SNIPPET))"
 
-        printf "${RED_S}${BOLD}  ▶  NGINX ERROR LOG MONITOR${R}\n"
-        printf "  ${DGRAY}%-${COL_ERR_DOM}s %-${COL_ERR_TIME}s %-${COL_ERR_DELTA}s %-${COL_ERR_CLIENT}s %-${COL_ERR_REQ}s %s${R}\n" \
-            "DOMAIN" "LAST SEEN" "Δ NEW" "CLIENT IP" "REQUEST" "ERROR SNIPPET"
-        printf "  ${DGRAY}%-${COL_ERR_DOM}s %-${COL_ERR_TIME}s %-${COL_ERR_DELTA}s %-${COL_ERR_CLIENT}s %-${COL_ERR_REQ}s %s${R}\n" \
-            "$(printf '─%.0s' $(seq 1 $COL_ERR_DOM))" \
-            "$(printf '─%.0s' $(seq 1 $COL_ERR_TIME))" \
-            "──────" \
-            "$(printf '─%.0s' $(seq 1 $COL_ERR_CLIENT))" \
-            "$(printf '─%.0s' $(seq 1 $COL_ERR_REQ))" \
-            "$(printf '─%.0s' $(seq 1 $COL_ERR_SNIPPET))"
-
+        local NEW_ERR_STATE found_any=0
         NEW_ERR_STATE=$(mktemp)
-        found_any=0
 
         for errlog in $ERRORLOG_PATH; do
             [ -f "$errlog" ] || continue
+            local domain
             domain=$(echo "$errlog" | cut -d'/' -f5)
+
+            # Collect into a temp file to avoid subshell variable loss
+            local err_tmp
+            err_tmp=$(mktemp)
 
             tail -n 200 "$errlog" 2>/dev/null | awk '
             /\[error\]/ {
@@ -2243,24 +1418,13 @@ _abuse_colour() {
                 sub(/^ \*[0-9]+ /, "", snippet)
 
                 client = ""
-                if (match(snippet, /client: ([0-9.]+|[0-9a-f:]+)/, arr)) {
+                if (match(snippet, /client: ([0-9.]+|[0-9a-f:]+)/, arr))
                     client = arr[1]
-                } else {
-                    n = split(snippet, parts, ", ")
-                    for (j=1; j<=n; j++) {
-                        if (parts[j] ~ /^client:/) { client = parts[j]; sub(/^client: /,"",client); break }
-                    }
-                }
 
                 req = ""
                 if (match(snippet, /request: "([^"]+)"/, arr2)) {
                     req = arr2[1]
                     sub(/ HTTP\/[0-9.]+$/, "", req)
-                } else {
-                    n2 = split(snippet, parts2, ", ")
-                    for (j2=1; j2<=n2; j2++) {
-                        if (parts2[j2] ~ /^request:/) { req = parts2[j2]; sub(/^request: "/,"",req); sub(/"$/,"",req); break }
-                    }
                 }
 
                 core = snippet
@@ -2271,146 +1435,132 @@ _abuse_colour() {
                 if (!(key in seen)) {
                     seen[key] = 1
                     latest_ts[key] = ts
-                    client_ip[key]  = client
-                    request[key]    = req
-                    message[key]    = core
+                    client_ip[key] = client
+                    request[key] = req
+                    message[key] = core
                 } else {
                     if (ts > latest_ts[key]) latest_ts[key] = ts
                 }
                 total[key]++
             }
             END {
-                for (k in seen) {
+                for (k in seen)
                     printf "%s\t%s\t%d\t%s\t%s\n", latest_ts[k], client_ip[k], total[k], request[k], message[k]
-                }
-            }' | sort -t$'\t' -k1,1r | head -6 | \
-            while IFS=$'\t' read -r ts client cnt req msg; do
-                found_any=1
-                cnt=$(( ${cnt:-0} + 0 ))
+            }' | sort -t$'\t' -k1,1r | head -4 > "$err_tmp"
 
-                state_key="${domain}|${client}|${req}"
+            while IFS=$'\t' read -r ts client cnt req msg; do
+                [ -z "$ts" ] && continue
+                found_any=1
+                cnt=$(to_int "$cnt")
+
+                local state_key="${domain}|${client}|${req}"
                 echo "${state_key}=${cnt}" >> "$NEW_ERR_STATE"
 
-                prev_cnt=$(grep "^${state_key}=" "$ERRLOG_STATE" 2>/dev/null | cut -d'=' -f2)
-                prev_cnt=$(( ${prev_cnt:-0} + 0 ))
+                local prev_cnt delta
+                prev_cnt=$(grep -F "${state_key}=" "$ERRLOG_STATE" 2>/dev/null | head -1 | rev | cut -d'=' -f1 | rev)
+                prev_cnt=$(to_int "$prev_cnt")
 
                 if [ "$prev_cnt" -gt 0 ] && [ "$cnt" -ne "$prev_cnt" ]; then
-                    diff=$(( cnt - prev_cnt ))
-                    if [ "$diff" -gt 0 ]; then
-                        delta="${RED}${BOLD}+${diff}${R}"
-                    else
-                        delta="${GREEN_S}${diff}${R}"
-                    fi
+                    local diff=$(( cnt - prev_cnt ))
+                    [ "$diff" -gt 0 ] && delta="${RED}${BOLD}+${diff}${R}" || delta="${GREEN_S}${diff}${R}"
                 elif [ "$prev_cnt" -eq 0 ]; then
                     delta="${ORANGE}${BOLD}NEW${R}"
                 else
-                    delta="${DGRAY}—${R}"
+                    delta="${DGRAY}-${R}"
                 fi
 
-                msg_short="${msg:0:$COL_ERR_SNIPPET}"
-
-                printf "  \033[38;5;114m%-${COL_ERR_DOM}.${COL_ERR_DOM}s\033[0m" "$domain"
-                printf " \033[38;5;244m%-${COL_ERR_TIME}.${COL_ERR_TIME}s\033[0m" "$ts"
-                printf " %-${COL_ERR_DELTA}b" "$delta"
-                printf " \033[38;5;203m%-${COL_ERR_CLIENT}.${COL_ERR_CLIENT}s\033[0m" "$client"
-                printf " \033[38;5;45m%-${COL_ERR_REQ}.${COL_ERR_REQ}s\033[0m" "$req"
-                printf " \033[38;5;255m%s\033[0m\n" "$msg_short"
-            done
+                local msg_short="${msg:0:$COL_ERR_SNIPPET}"
+                printf "  ${GREEN_S}%-20.20s${R}" "$domain"
+                printf " ${GRAY}%-18.18s${R}" "$ts"
+                printf " %-6b" "$delta"
+                printf " ${RED_S}%-16.16s${R}" "$client"
+                printf " ${CYAN}%-22.22s${R}" "$req"
+                printf " ${WHITE}%s${R}\n" "$msg_short"
+            done < "$err_tmp"
+            rm -f "$err_tmp"
         done
 
         [ -s "$NEW_ERR_STATE" ] && mv "$NEW_ERR_STATE" "$ERRLOG_STATE" || rm -f "$NEW_ERR_STATE"
 
         if [ "$found_any" -eq 0 ]; then
-            printf "  ${GREEN_S}${DIM}(no errors found in nginx logs)${R}\n"
+            printf "  ${GREEN_S}${DIM}(no errors in nginx logs)${R}\n"
         fi
     }
-    hline '─' "$DGRAY"
+    hline '-' "$DGRAY"
 
-     # ════════════════════════════════════════════
-    #  BLOCK 4: PHP-FPM Pools (left) | MySQL Health (right)
+    # ════════════════════════════════════════════
+    #  BLOCK 7: PHP-FPM (left) | MySQL Health (right)
     # ════════════════════════════════════════════
     C1=$(mktemp); C2=$(mktemp)
 
     {
-        printf "${CYAN}${BOLD}  ▶  PHP-FPM POOLS${R}\n"
-        printf "  ${DGRAY}%-${COL_FPM_POOL}s %-${COL_FPM_ACT}s %-${COL_FPM_IDLE}s %-${COL_FPM_MAX}s %-${COL_FPM_QUEUE}s %s${R}\n" \
+        printf "${CYAN}${BOLD}  PHP-FPM POOLS${R}\n"
+        printf "  ${DGRAY}%-20s %-7s %-6s %-6s %-7s %s${R}\n" \
             "POOL" "ACTIVE" "IDLE" "MAX" "QUEUE" "STATUS"
-        printf "  ${DGRAY}%-${COL_FPM_POOL}s %-${COL_FPM_ACT}s %-${COL_FPM_IDLE}s %-${COL_FPM_MAX}s %-${COL_FPM_QUEUE}s %s${R}\n" \
-            "$(printf '─%.0s' $(seq 1 $COL_FPM_POOL))" "──────" "─────" "─────" "──────" "──────────"
+        printf "  ${DGRAY}%-20s %-7s %-6s %-6s %-7s %s${R}\n" \
+            "--------------------" "------" "-----" "-----" "------" "----------"
 
-        fpm_found=0
+        local fpm_found=0
 
         if command -v cgi-fcgi &>/dev/null; then
             for sock in /var/run/php*.sock /run/php/*.sock /tmp/php*.sock; do
                 [ -S "$sock" ] || continue
+                local pool status_raw active idle maxc queue
                 pool=$(basename "$sock" .sock | sed 's/php[0-9.-]*-fpm-\?//')
                 [ -z "$pool" ] && pool=$(basename "$sock" .sock)
 
                 status_raw=$(SCRIPT_FILENAME=/status SCRIPT_NAME=/status \
                     REQUEST_METHOD=GET cgi-fcgi -bind -connect "$sock" 2>/dev/null)
 
-                active=$(echo "$status_raw" | grep "^active processes:"  | awk '{print $NF}')
-                idle=$(echo   "$status_raw" | grep "^idle processes:"    | awk '{print $NF}')
-                maxc=$(echo   "$status_raw" | grep "^max children reached" | awk '{print $NF}')
-                queue=$(echo  "$status_raw" | grep "^listen queue:"      | awk '{print $NF}')
-                maxq=$(echo  "$status_raw" | grep "^max listen queue:"  | awk '{print $NF}')
+                active=$(echo "$status_raw" | awk '/^active processes:/{print $NF}')
+                idle=$(echo "$status_raw"   | awk '/^idle processes:/{print $NF}')
+                maxc=$(echo "$status_raw"   | awk '/^max children reached/{print $NF}')
+                queue=$(echo "$status_raw"  | awk '/^listen queue:/{print $NF}')
 
                 [ -z "$active" ] && continue
                 fpm_found=1
 
+                local total pct st
                 total=$(( ${active:-0} + ${idle:-0} ))
                 [ "$total" -eq 0 ] && total=1
-                pct=$(( ${active:-0} * 100 / total ))
+                pct=$(( active * 100 / total ))
 
-                if   [ "${active:-0}" -ge "${maxc:-999}" ] 2>/dev/null; then
-                    st="${RED}${BOLD}⚠ SATURATED${R}"
+                if [ "${active:-0}" -ge "${maxc:-999}" ] 2>/dev/null; then
+                    st="${RED}${BOLD}SATURATED${R}"
                 elif [ "$pct" -ge 80 ]; then
-                    st="${ORANGE}▲ HIGH${R}"
+                    st="${ORANGE}HIGH${R}"
                 else
-                    st="${GREEN_S}✔ OK${R}"
+                    st="${GREEN_S}OK${R}"
                 fi
 
-                printf "  ${WHITE}%-${COL_FPM_POOL}.${COL_FPM_POOL}s${R} " "$pool"
-                printf "${ORANGE}%-${COL_FPM_ACT}s${R} "    "$active"
-                printf "${GRAY}%-${COL_FPM_IDLE}s${R} "     "$idle"
-                printf "${DGRAY}%-${COL_FPM_MAX}s${R} "     "${maxc:-?}"
-                printf "${YELLOW}%-${COL_FPM_QUEUE}s${R} "  "$queue"
-                printf "%b\n" "$st"
+                printf "  ${WHITE}%-20.20s${R} ${ORANGE}%-7s${R} ${GRAY}%-6s${R} ${DGRAY}%-6s${R} ${YELLOW}%-7s${R} %b\n" \
+                    "$pool" "$active" "$idle" "${maxc:-?}" "$queue" "$st"
             done
         fi
 
         if [ "$fpm_found" -eq 0 ]; then
-            ps -eo comm,stat 2>/dev/null | awk '
-            /php-fpm/ || /php[0-9].*-fpm/ {
-                if ($2 ~ /^S/) idle++
-                else if ($2 ~ /^R/) active++
-                total++
-            }
-            END {
-                if (total > 0) {
-                    pct = int(active*100/total)
-                    st = (pct >= 80) ? "\033[38;5;196mHIGH\033[0m" : "\033[38;5;82m✔ OK\033[0m"
-                    printf "  \033[38;5;255m%-20s\033[0m %-7s %-6s %-6s %-7s %b\n",
-                        "php-fpm", active+0, idle+0, total, "n/a", st
-                } else {
-                    print "  \033[38;5;244m(php-fpm not detected or status page unreachable)\033[0m"
-                }
-            }'
+            local fpm_count
+            fpm_count=$(ps -eo comm 2>/dev/null | grep -c "php-fpm\|php[0-9].*-fpm")
+            if [ "${fpm_count:-0}" -gt 0 ]; then
+                printf "  ${WHITE}%-20s${R} ${GRAY}%s workers detected${R}\n" "php-fpm" "$fpm_count"
+            else
+                printf "  ${GRAY}${DIM}(php-fpm not detected)${R}\n"
+            fi
         fi
     } > "$C1"
 
     {
-        printf "${MAGENTA}${BOLD}  ▶  MYSQL HEALTH${R}\n"
-        printf "  ${DGRAY}%-${COL_MH_LABEL}s %s${R}\n" "METRIC" "VALUE"
-        printf "  ${DGRAY}%-${COL_MH_LABEL}s %s${R}\n" "$(printf '─%.0s' $(seq 1 $COL_MH_LABEL))" "──────────────"
+        printf "${MAGENTA}${BOLD}  MYSQL HEALTH${R}\n"
+        printf "  ${DGRAY}%-18s %s${R}\n" "METRIC" "VALUE"
+        printf "  ${DGRAY}%-18s %s${R}\n" "------------------" "--------------"
 
+        local mysql_health
         mysql_health=$(mysql --batch --silent -e "
             SHOW GLOBAL STATUS WHERE Variable_name IN (
-                'Threads_connected','Threads_running','max_used_connections',
-                'Questions','Slow_queries','Table_locks_waited',
+                'Threads_connected','Threads_running','Questions',
+                'Slow_queries','Table_locks_waited',
                 'Innodb_buffer_pool_reads','Innodb_buffer_pool_read_requests',
-                'Innodb_row_lock_waits','Com_select','Com_insert',
-                'Com_update','Com_delete','Aborted_connects'
+                'Innodb_row_lock_waits','Aborted_connects'
             );
             SHOW VARIABLES WHERE Variable_name = 'max_connections';" 2>/dev/null)
 
@@ -2419,161 +1569,160 @@ _abuse_colour() {
         else
             get_val() { echo "$mysql_health" | awk -v k="$1" '$1==k{print $2}'; }
 
+            local threads_conn threads_run max_conn questions slow_q
+            local lock_wait bp_reads bp_req row_locks aborted
             threads_conn=$(get_val "Threads_connected")
-            threads_run=$(get_val  "Threads_running")
-            max_conn=$(get_val     "max_connections")
-            questions=$(get_val    "Questions")
-            slow_q=$(get_val       "Slow_queries")
-            lock_wait=$(get_val    "Table_locks_waited")
-            bp_reads=$(get_val     "Innodb_buffer_pool_reads")
-            bp_req=$(get_val       "Innodb_buffer_pool_read_requests")
-            row_locks=$(get_val    "Innodb_row_lock_waits")
-            aborted=$(get_val      "Aborted_connects")
+            threads_run=$(get_val "Threads_running")
+            max_conn=$(get_val "max_connections")
+            questions=$(get_val "Questions")
+            slow_q=$(get_val "Slow_queries")
+            lock_wait=$(get_val "Table_locks_waited")
+            bp_reads=$(get_val "Innodb_buffer_pool_reads")
+            bp_req=$(get_val "Innodb_buffer_pool_read_requests")
+            row_locks=$(get_val "Innodb_row_lock_waits")
+            aborted=$(get_val "Aborted_connects")
 
-            # ── QPS delta ─────────────────────────
-            prev_q=$(cat "$MYSQL_QPS_STATE" 2>/dev/null || echo 0)
-            questions=$(( ${questions:-0} + 0 ))   # fix: coerce to int — prevents arithmetic syntax error on empty value
-            max_conn=$(( ${max_conn:-0} + 0 ))       # fix: strip whitespace/newlines before division
-            threads_conn=$(( ${threads_conn:-0} + 0 ))
+            # Coerce to int
+            threads_conn=$(to_int "$threads_conn")
+            threads_run=$(to_int "$threads_run")
+            max_conn=$(to_int "$max_conn")
+            questions=$(to_int "$questions")
+            slow_q=$(to_int "$slow_q")
+            lock_wait=$(to_int "$lock_wait")
+            bp_reads=$(to_int "$bp_reads")
+            bp_req=$(to_int "$bp_req")
+
+            # QPS — use actual elapsed time, not assumed 20s
+            local prev_q prev_ts QPS
+            prev_q=$(cat "$MYSQL_QPS_STATE" 2>/dev/null | tr -d '[:space:]')
+            prev_ts=$(cat "$MYSQL_QPS_TS" 2>/dev/null | tr -d '[:space:]')
+            prev_q=$(to_int "$prev_q")
+            prev_ts=$(to_int "$prev_ts")
             QPS=0
-            if [ -n "$questions" ] && [ "${prev_q:-0}" -gt 0 ] && [ "$questions" -ge "${prev_q:-0}" ] 2>/dev/null; then
-                QPS=$(( (questions - prev_q) / 20 ))   # 20s refresh interval
+            local now_ts
+            now_ts=$(date +%s)
+            if [ "$prev_q" -gt 0 ] && [ "$questions" -ge "$prev_q" ] && [ "$prev_ts" -gt 0 ]; then
+                local elapsed=$(( now_ts - prev_ts ))
+                [ "$elapsed" -le 0 ] && elapsed=1
+                QPS=$(( (questions - prev_q) / elapsed ))
                 [ "$QPS" -lt 0 ] && QPS=0
             fi
-            echo "${questions:-0}" > "$MYSQL_QPS_STATE"
+            echo "$questions" > "$MYSQL_QPS_STATE"
+            echo "$now_ts"    > "$MYSQL_QPS_TS"
 
-            # ── InnoDB buffer pool hit rate ────────────────────────────
-            BP_HIT="n/a"
-                if [ "$bp_req" -gt 0 ]; then
-                BP_HIT=$(awk -v r="$bp_reads" -v req="$bp_req" \
-                    'BEGIN{printf "%.1f%%", (1-(r/req))*100}')
+            # InnoDB buffer pool hit rate
+            local BP_HIT="n/a"
+            if [ "$bp_req" -gt 0 ]; then
+                BP_HIT=$(awk -v r="$bp_reads" -v req="$bp_req" 'BEGIN{printf "%.1f%%", (1-(r/req))*100}')
             fi
 
-            # ── Colour thresholds ──────────────────────────────────────
-            conn_pct=0
+            # Thresholds
+            local conn_pct=0
             [ "$max_conn" -gt 0 ] && conn_pct=$(( threads_conn * 100 / max_conn ))
 
-            conn_col="${GREEN_S}";   [ "$conn_pct"    -ge 70 ] && conn_col="${ORANGE}";  [ "$conn_pct"    -ge 90 ] && conn_col="${RED}${BOLD}"
-            run_col="${GREEN_S}";    [ "$threads_run"  -ge 10 ] && run_col="${ORANGE}";   [ "$threads_run"  -ge 30 ] && run_col="${RED}${BOLD}"
-            slow_col="${GREEN_S}";   [ "$slow_q"       -ge 5  ] && slow_col="${ORANGE}";  [ "$slow_q"       -ge 20 ] && slow_col="${RED}${BOLD}"
-            lock_col="${GREEN_S}";   [ "$lock_wait"    -ge 1  ] && lock_col="${ORANGE}";  [ "$lock_wait"    -ge 10 ] && lock_col="${RED}${BOLD}"
-            qps_col="${GREEN_S}";    [ "$QPS"          -ge 500 ] && qps_col="${ORANGE}";  [ "$QPS"          -ge 2000 ] && qps_col="${RED}${BOLD}"
+            local conn_col="${GREEN_S}" run_col="${GREEN_S}" slow_col="${GREEN_S}"
+            local lock_col="${GREEN_S}" qps_col="${GREEN_S}"
+            [ "$conn_pct"    -ge 70  ] && conn_col="${ORANGE}";  [ "$conn_pct"    -ge 90   ] && conn_col="${RED}${BOLD}"
+            [ "$threads_run" -ge 10  ] && run_col="${ORANGE}";   [ "$threads_run" -ge 30   ] && run_col="${RED}${BOLD}"
+            [ "$slow_q"      -ge 5   ] && slow_col="${ORANGE}";  [ "$slow_q"      -ge 20   ] && slow_col="${RED}${BOLD}"
+            [ "$lock_wait"   -ge 1   ] && lock_col="${ORANGE}";  [ "$lock_wait"   -ge 10   ] && lock_col="${RED}${BOLD}"
+            [ "$QPS"         -ge 500 ] && qps_col="${ORANGE}";   [ "$QPS"         -ge 2000 ] && qps_col="${RED}${BOLD}"
 
-            bp_col="${GREEN_S}"
-            if [ "$BP_HIT" != "n/a" ]; then
-                bp_col=$(awk -v h="$BP_HIT" 'BEGIN{
-                    v = h + 0
-                    if (v < 95)      print "\033[38;5;196m\033[1m"
-                    else if (v < 99) print "\033[38;5;214m"
-                    else             print "\033[38;5;114m"
-                }')
-            fi
-
-            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${conn_col}%s / %s${R} ${DGRAY}(%s%%)${R}\n" \
-                "Connections" "$threads_conn" "$max_conn" "$conn_pct"
-            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${run_col}%s${R}\n" \
-                "Threads running"  "$threads_run"
-            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${qps_col}%s q/s${R}\n" \
-                "QPS (last 20s)"   "$QPS"
-            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${slow_col}%s${R}\n" \
-                "Slow queries"     "$slow_q"
-            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${lock_col}%s${R}\n" \
-                "Table lock waits" "$lock_wait"
-            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${bp_col}%s${R}\n" \
-                "InnoDB hit rate"  "$BP_HIT"
-            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${ORANGE}%s${R}\n" \
-                "Row lock waits"   "$row_locks"
-            printf "  ${DGRAY}%-${COL_MH_LABEL}s${R} ${GRAY}%s${R}\n" \
-                "Aborted connects" "$aborted"
+            printf "  ${DGRAY}%-18s${R} ${conn_col}%s / %s${R} ${DGRAY}(%s%%)${R}\n" "Connections" "$threads_conn" "$max_conn" "$conn_pct"
+            printf "  ${DGRAY}%-18s${R} ${run_col}%s${R}\n"  "Threads running" "$threads_run"
+            printf "  ${DGRAY}%-18s${R} ${qps_col}%s q/s${R}\n" "QPS (actual)" "$QPS"
+            printf "  ${DGRAY}%-18s${R} ${slow_col}%s${R}\n" "Slow queries" "$slow_q"
+            printf "  ${DGRAY}%-18s${R} ${lock_col}%s${R}\n" "Table lock waits" "$lock_wait"
+            printf "  ${DGRAY}%-18s${R} ${GREEN_S}%s${R}\n"  "InnoDB hit rate" "$BP_HIT"
+            printf "  ${DGRAY}%-18s${R} ${ORANGE}%s${R}\n"   "Row lock waits" "$row_locks"
+            printf "  ${DGRAY}%-18s${R} ${GRAY}%s${R}\n"     "Aborted connects" "$aborted"
         fi
     } > "$C2"
 
     render_two_cols "$C1" "$C2"
     rm -f "$C1" "$C2"
-    hline '─' "$DGRAY"
-
-
+    hline '-' "$DGRAY"
 
     # ════════════════════════════════════════════
     #  BLOCK 8: DISK I/O — FULL WIDTH
     # ════════════════════════════════════════════
     {
-        printf "${YELLOW}${BOLD}  ▶  DISK I/O${R}\n"
-        printf "  ${DGRAY}%-${COL_IO_DEV}s %-${COL_IO_READ}s %-${COL_IO_WRITE}s %-${COL_IO_AWAIT}s %-${COL_IO_UTIL}s %s${R}\n" \
+        printf "${YELLOW}${BOLD}  DISK I/O${R}\n"
+        printf "  ${DGRAY}%-10s %-10s %-10s %-12s %-8s %s${R}\n" \
             "DEVICE" "READ/s" "WRITE/s" "AWAIT(ms)" "UTIL%" "STATUS"
-        printf "  ${DGRAY}%-${COL_IO_DEV}s %-${COL_IO_READ}s %-${COL_IO_WRITE}s %-${COL_IO_AWAIT}s %-${COL_IO_UTIL}s %s${R}\n" \
-            "──────────" "──────────" "──────────" "────────────" "────────" "──────────"
+        printf "  ${DGRAY}%-10s %-10s %-10s %-12s %-8s %s${R}\n" \
+            "----------" "----------" "----------" "------------" "--------" "----------"
 
         if command -v iostat &>/dev/null; then
-            iostat -xk 1 2 2>/dev/null | awk '
+            # Use -y for fresh stats, 1 sample of 1 second
+            iostat -xk -y 1 1 2>/dev/null | awk '
             /^(sd|nvme|vd|xvd|hd)[a-z0-9]/ {
                 dev=$1; rkbs=$6; wkbs=$7; await=$10; util=$NF
                 uc="\033[38;5;82m"
                 if (util+0 >= 50) uc="\033[38;5;214m"
                 if (util+0 >= 85) uc="\033[38;5;196m\033[1m"
                 ac="\033[38;5;82m"
-                if (await+0 >= 20)  ac="\033[38;5;214m"
+                if (await+0 >= 20) ac="\033[38;5;214m"
                 if (await+0 >= 100) ac="\033[38;5;196m\033[1m"
 
-                st="✔ OK"
-                stc="\033[38;5;82m"
-                if (util+0 >= 85 || await+0 >= 100) { st="⚠ HIGH"; stc="\033[38;5;196m\033[1m" }
-                else if (util+0 >= 50 || await+0 >= 20) { st="▲ BUSY"; stc="\033[38;5;214m" }
+                st="OK"; stc="\033[38;5;82m"
+                if (util+0 >= 85 || await+0 >= 100) { st="HIGH"; stc="\033[38;5;196m\033[1m" }
+                else if (util+0 >= 50 || await+0 >= 20) { st="BUSY"; stc="\033[38;5;214m" }
 
-                printf "  \033[38;5;255m%-10s\033[0m %s%-9s\033[0m %s%-9s\033[0m %s%-10s\033[0m %s%-8s\033[0m %b%s\033[0m\n",
+                printf "  \033[38;5;255m%-10s\033[0m %s%-9s\033[0m %s%-9s\033[0m %s%-10s\033[0m %s%-8s\033[0m %s%s\033[0m\n",
                     dev,
-                    "\033[38;5;45m",  sprintf("%.0fK", rkbs),
+                    "\033[38;5;45m", sprintf("%.0fK", rkbs),
                     "\033[38;5;171m", sprintf("%.0fK", wkbs),
                     ac, sprintf("%.1fms", await),
                     uc, sprintf("%.0f%%", util),
                     stc, st
-            }' | tail -n +2
+            }'
         else
+            # Fallback: /proc/diskstats delta
+            local snap1 snap2
             snap1=$(awk '/^[ ]*[0-9]+ [0-9]+ (sd|nvme|vd)/ {print $3,$6,$10,$13}' /proc/diskstats 2>/dev/null)
             sleep 1
             snap2=$(awk '/^[ ]*[0-9]+ [0-9]+ (sd|nvme|vd)/ {print $3,$6,$10,$13}' /proc/diskstats 2>/dev/null)
-
             paste <(echo "$snap1") <(echo "$snap2") | awk '{
                 dev=$1
-                dr=($6-$2)*512/1024
-                dw=($7-$3)*512/1024
+                dr=($6-$2)*512/1024; dw=($7-$3)*512/1024
                 dio_ms=($8-$4)
-                util=(dio_ms > 1000) ? 100 : (dio_ms > 0 ? dio_ms/10 : 0)
-
+                util=(dio_ms>1000)?100:(dio_ms>0?dio_ms/10:0)
                 uc="\033[38;5;82m"
-                if (util >= 50) uc="\033[38;5;214m"
-                if (util >= 85) uc="\033[38;5;196m\033[1m"
-
-                st="✔ OK"; stc="\033[38;5;82m"
-                if (util >= 85) { st="⚠ HIGH"; stc="\033[38;5;196m\033[1m" }
-                else if (util >= 50) { st="▲ BUSY"; stc="\033[38;5;214m" }
-
-                printf "  \033[38;5;255m%-10s\033[0m \033[38;5;45m%-10s\033[0m \033[38;5;171m%-10s\033[0m \033[38;5;244m%-12s\033[0m %s%-8s\033[0m %b%s\033[0m\n",
-                    dev,
-                    sprintf("%.0fK/s", dr),
-                    sprintf("%.0fK/s", dw),
-                    "n/a",
-                    uc, sprintf("%.0f%%", util),
-                    stc, st
+                if(util>=50) uc="\033[38;5;214m"
+                if(util>=85) uc="\033[38;5;196m\033[1m"
+                st="OK"; stc="\033[38;5;82m"
+                if(util>=85){st="HIGH";stc="\033[38;5;196m\033[1m"}
+                else if(util>=50){st="BUSY";stc="\033[38;5;214m"}
+                printf "  \033[38;5;255m%-10s\033[0m \033[38;5;45m%-10s\033[0m \033[38;5;171m%-10s\033[0m \033[38;5;244m%-12s\033[0m %s%-8s\033[0m %s%s\033[0m\n",
+                    dev, sprintf("%.0fK/s",dr), sprintf("%.0fK/s",dw), "n/a", uc, sprintf("%.0f%%",util), stc, st
             }'
         fi
     }
-    hline '─' "$DGRAY"
-
-
+    hline '-' "$DGRAY"
 
     # ── FOOTER ────────────────────────────────────
+    local LOOP_END LOOP_ELAPSED
+    LOOP_END=$(date +%s)
+    LOOP_ELAPSED=$(( LOOP_END - LOOP_START ))
+
     printf "\n"
-    hline '═' "$BLUE_D"
-    printf "  ${GRAY}${DIM}Refreshing in ${R}${BOLD}${CYAN}20s${R}  ${DGRAY}•${R}  ${GRAY}${DIM}Ctrl+C to exit + generate report${R}\n"
-    hline '═' "$BLUE_D"
+    hline '=' "$BLUE_D"
+    printf "  ${GRAY}${DIM}Refresh in ${R}${BOLD}${CYAN}${REFRESH_INTERVAL}s${R}  "
+    printf "${DGRAY}|${R}  ${GRAY}${DIM}Frame: ${R}${WHITE}${LOOP_ELAPSED}s${R}  "
+    printf "${DGRAY}|${R}  ${GRAY}${DIM}Ctrl+C to exit + report${R}\n"
+    hline '=' "$BLUE_D"
     printf "\n"
 
-    } > "$FRAME"
+}
+
+while true; do
+    render_frame > "$FRAME"
 
     clear
     cat "$FRAME"
 
-    sleep 20
+    sleep "$REFRESH_INTERVAL"
 done
+
 rm -f "$FRAME"
